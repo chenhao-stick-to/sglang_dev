@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -474,6 +474,26 @@ class SWAComponent(TreeComponent):
                     host_indices=torch.cat(backed_up),
                     device_indices=None,
                     nodes_to_load=nodes,
+                )
+            ]
+
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=cd.host_value,
+                    keys=node.hash_value,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
                 )
             ]
 

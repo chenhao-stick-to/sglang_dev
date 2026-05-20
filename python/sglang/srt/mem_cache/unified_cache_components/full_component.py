@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -245,6 +245,26 @@ class FullComponent(TreeComponent):
                     ),
                     device_indices=None,
                     nodes_to_load=nodes,
+                )
+            ]
+
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    host_indices=cd.host_value,
+                    keys=node.hash_value,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            return [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
                 )
             ]
 

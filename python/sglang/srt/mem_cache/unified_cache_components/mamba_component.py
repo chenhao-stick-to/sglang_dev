@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -391,6 +391,27 @@ class MambaComponent(TreeComponent):
                 )
 
             return transfers if transfers else None
+
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=cd.host_value,
+                    keys=node.hash_value,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            return [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
 
         return None
 

@@ -66,6 +66,13 @@ class ComponentData:
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
 
+    def protect_host(self):
+        self.host_lock_ref += 1
+
+    def release_host(self):
+        assert self.host_lock_ref > 0, "host_lock_ref is already zero"
+        self.host_lock_ref -= 1
+
 
 class EvictLayer(IntFlag):
     """Which storage layer(s) to evict.  Combinable via bitwise OR."""
