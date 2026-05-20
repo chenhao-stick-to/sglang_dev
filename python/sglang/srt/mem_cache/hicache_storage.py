@@ -139,7 +139,7 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
-    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+    def  register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
