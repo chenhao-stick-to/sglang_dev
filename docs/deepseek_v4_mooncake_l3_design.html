@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepSeekV4 Mooncake L3 Storage Design</title>
+  <style>
+    :root {
+      --ink: #17211b;
+      --muted: #607267;
+      --paper: #f6f2e8;
+      --panel: #ffffff;
+      --line: #cfd8ce;
+      --green: #1d6b4f;
+      --blue: #245f8f;
+      --red: #9b3d32;
+      --gold: #b9851b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(135deg, rgba(29, 107, 79, 0.08), transparent 34%),
+        linear-gradient(315deg, rgba(185, 133, 27, 0.12), transparent 32%),
+        var(--paper);
+      font-family: ui-serif, Georgia, "Times New Roman", serif;
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 64px;
+    }
+
+    header {
+      border-bottom: 2px solid var(--ink);
+      padding-bottom: 24px;
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 14px;
+      font-size: 26px;
+      line-height: 1.15;
+      border-left: 6px solid var(--green);
+      padding-left: 12px;
+    }
+
+    p { margin: 0 0 14px; }
+
+    code {
+      background: rgba(23, 33, 27, 0.08);
+      border: 1px solid rgba(23, 33, 27, 0.12);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    .lede {
+      max-width: 860px;
+      color: var(--muted);
+      font-size: 19px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 18px 0;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(23, 33, 27, 0.06);
+    }
+
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 19px;
+    }
+
+    .tag {
+      display: inline-block;
+      margin: 0 6px 8px 0;
+      border-radius: 999px;
+      padding: 4px 9px;
+      color: #fff;
+      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .required { background: var(--blue); }
+    .window { background: var(--green); }
+    .best { background: var(--gold); }
+    .risk { background: var(--red); }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 20px 0;
+    }
+
+    .step {
+      background: rgba(255, 255, 255, 0.76);
+      border: 1px solid var(--line);
+      border-top: 5px solid var(--green);
+      border-radius: 8px;
+      min-height: 148px;
+      padding: 14px;
+    }
+
+    .step strong {
+      display: block;
+      font-size: 16px;
+      margin-bottom: 8px;
+    }
+
+    ul {
+      margin: 10px 0 0 18px;
+      padding: 0;
+    }
+
+    li { margin: 6px 0; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      margin: 16px 0;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 11px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: rgba(29, 107, 79, 0.1);
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .note {
+      border-left: 6px solid var(--gold);
+      background: rgba(255, 255, 255, 0.7);
+      padding: 14px 16px;
+      border-radius: 0 8px 8px 0;
+      margin: 18px 0;
+    }
+
+    @media (max-width: 820px) {
+      main { width: min(100% - 22px, 1120px); padding-top: 30px; }
+      .grid, .flow { grid-template-columns: 1fr; }
+      table { font-size: 14px; }
+      th, td { padding: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>DeepSeekV4 Mooncake L3 Storage</h1>
+      <p class="lede">
+        This design makes Mooncake storage usable for DeepSeekV4 hybrid cache by
+        separating full-prefix compressed KV data from SWA-window state data.
+        The storage hit result now matches the radix tree validator: a returned
+        prefix can become a valid host-backed best node.
+      </p>
+    </header>
+
+    <section>
+      <h2>Pool Semantics</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Required Prefix Pools</h3>
+          <span class="tag required">c4</span>
+          <span class="tag required">c4_indexer</span>
+          <span class="tag required">c128</span>
+          <p>
+            These pools are part of the compressed KV prefix. Mooncake checks
+            their longest common prefix and converts each pool boundary back to
+            KV-page granularity. The final full-prefix candidate is the minimum
+            across all required pools.
+          </p>
+        </article>
+        <article class="card">
+          <h3>SWA Window Pools</h3>
+          <span class="tag window">swa</span>
+          <span class="tag window">c4_state</span>
+          <span class="tag window">c4_indexer_state</span>
+          <span class="tag window">c128_state</span>
+          <p>
+            These pools only need to cover the tail window used by SWA
+            validation. They are not full-prefix requirements, but the returned
+            hit length is rolled back until the tail window exists in every
+            available SWA-window pool.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Key Construction</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Pool Class</th>
+            <th>Key Rule</th>
+            <th>Compatibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Required prefix</td>
+            <td>Build chained hashes at each host pool page size with <code>get_hash_str(page_tokens, prior_hash)</code>.</td>
+            <td>Read and exists use new keys first, then fall back to legacy expanded KV-page keys.</td>
+          </tr>
+          <tr>
+            <td>SWA window</td>
+            <td>Build independent hashes at <code>swa_page_size</code> with <code>get_hash_str(page_tokens, None)</code>.</td>
+            <td>Read and exists also support legacy fallback. Writes only emit the new key form.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note">
+        Token ids, the previous prefix hash, sliding-window size, and per-pool
+        token ranges are carried through <code>HiCacheStorageExtraInfo.extra_info</code>.
+        The Mooncake backend does not inspect radix tree state directly.
+      </div>
+    </section>
+
+    <section>
+      <h2>Exists Algorithm</h2>
+      <div class="flow">
+        <div class="step">
+          <strong>1. Anchor</strong>
+          Start from v1 KV storage when the anchor has payload. For DeepSeekV4's
+          logical anchor, use all requested KV pages as the initial candidate.
+        </div>
+        <div class="step">
+          <strong>2. Prefix Pools</strong>
+          Query <code>c4</code>, <code>c4_indexer</code>, and <code>c128</code>
+          with chained per-pool keys. Take the longest common KV-page prefix.
+        </div>
+        <div class="step">
+          <strong>3. SWA Window</strong>
+          Query SWA-window pools. Walk the candidate prefix backward until the
+          tail window has all required pages.
+        </div>
+        <div class="step">
+          <strong>4. Publish</strong>
+          Return <code>kv_hit_pages</code> only after both prefix and SWA-window
+          checks pass. This length is safe to insert into the host radix tree.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Backup And Prefetch</h2>
+      <ul>
+        <li><code>batch_set_v2()</code> writes required-prefix pools and SWA-window pools with the same key builder used for reads.</li>
+        <li>Backup completion for a logical DeepSeekV4 anchor is the minimum successful prefix across required pools.</li>
+        <li>SWA-window writes are best effort. A failed SWA state write does not shorten backup completion, but it will reduce future L3 hits.</li>
+        <li>Prefetch allocates SWA host slots only for the confirmed tail window, then sidecar state pools reuse those SWA indices.</li>
+        <li>The host radix tree splits the inserted FULL node when needed so only the tail node carries <code>ComponentType.SWA.host_value</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Safety Properties</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Risk</th>
+            <th>Guard</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Returning a host prefix that SWA cannot validate</td>
+            <td><code>batch_exists_v2()</code> rolls the candidate back until the tail window exists.</td>
+          </tr>
+          <tr>
+            <td>Reading stale legacy Mooncake entries</td>
+            <td>Legacy fallback is read-only. New writes use only the new DSV4 key scheme.</td>
+          </tr>
+          <tr>
+            <td>Publishing failed SWA get results into the tree</td>
+            <td>Logical-anchor prefetch requires SWA-window get success before marking tokens completed.</td>
+          </tr>
+          <tr>
+            <td>Changing non-DeepSeekV4 behavior</td>
+            <td>The DSV4 policy is enabled only when DSV4 sidecar pools are registered.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

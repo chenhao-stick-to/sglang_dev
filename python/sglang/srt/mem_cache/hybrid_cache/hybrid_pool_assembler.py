@@ -726,6 +726,7 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
+            cache_controller.sliding_window_size = params.sliding_window_size
             cache.components[ComponentType.FULL]._full_kv_pool_host = (
                 cache.full_kv_pool_host
             )

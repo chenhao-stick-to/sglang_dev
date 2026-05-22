@@ -1598,7 +1598,7 @@ class UnifiedRadixCache(BasePrefixCache):
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
-        sidecar_xfers = self._build_sidecar_transfers(
+        sidecar_xfers = self._build_sidecar_dma_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
@@ -1669,7 +1669,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if t:
                 comp_xfers[comp.component_type] = t
-        sidecar_xfers = self._build_sidecar_transfers(
+        sidecar_xfers = self._build_sidecar_dma_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
 
@@ -1724,12 +1724,17 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         return True
 
-    def _build_sidecar_transfers(
+    def _build_sidecar_dma_transfers(
         self,
         phase: CacheTransferPhase,
         kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> list[PoolTransfer]:
+        """Sidecar transfers for D↔H (device_indices and/or host_indices)."""
+        assert phase in (
+            CacheTransferPhase.BACKUP_HOST,
+            CacheTransferPhase.LOAD_BACK,
+        )
         transfers: list[PoolTransfer] = []
         for spec in self.sidecar_pool_specs:
             if spec.indices_from_pool == PoolName.KV:
@@ -1754,11 +1759,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         f"resolved to {indices_source.name} during {phase}."
                     )
 
-            indices = (
-                indices_source.device_indices
-                if phase == CacheTransferPhase.BACKUP_HOST
-                else indices_source.host_indices
-            )
+            if phase == CacheTransferPhase.BACKUP_HOST:
+                indices = indices_source.device_indices
+            else:
+                indices = indices_source.host_indices
             if indices is None or len(indices) == 0:
                 continue
             transfers.append(
@@ -1768,6 +1772,114 @@ class UnifiedRadixCache(BasePrefixCache):
                     indices_from_pool=spec.indices_from_pool,
                 )
             )
+        return transfers
+
+    def _build_sidecar_storage_transfers(
+        self,
+        phase: CacheTransferPhase,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> list[PoolTransfer]:
+        """Sidecar transfers for H↔Storage (indices_from_pool only at build time)."""
+        assert phase in (
+            CacheTransferPhase.BACKUP_STORAGE,
+            CacheTransferPhase.PREFETCH,
+        )
+        transfers: list[PoolTransfer] = []
+        for spec in self.sidecar_pool_specs:
+            if spec.indices_from_pool not in (PoolName.KV, PoolName.SWA, PoolName.MAMBA):
+                raise AssertionError(
+                    f"Unsupported sidecar indices source pool {spec.indices_from_pool}."
+                )
+            if spec.indices_from_pool != PoolName.KV:
+                source_component = {
+                    PoolName.SWA: ComponentType.SWA,
+                    PoolName.MAMBA: ComponentType.MAMBA,
+                }[spec.indices_from_pool]
+                if source_component not in comp_xfers:
+                    continue
+                src = comp_xfers[source_component][0]
+                if src.name != spec.indices_from_pool:
+                    raise AssertionError(
+                        f"Sidecar indices source pool {spec.indices_from_pool} "
+                        f"resolved to {src.name} during {phase}."
+                    )
+                if src.device_indices is not None:
+                    raise AssertionError(
+                        f"Storage-phase transfer {src.name} must not set device_indices."
+                    )
+            transfer = PoolTransfer(
+                name=spec.pool_name,
+                hit_policy=spec.hit_policy,
+                indices_from_pool=spec.indices_from_pool,
+            )
+            if phase == CacheTransferPhase.BACKUP_STORAGE and spec.indices_from_pool != PoolName.KV:
+                src = comp_xfers[
+                    {
+                        PoolName.SWA: ComponentType.SWA,
+                        PoolName.MAMBA: ComponentType.MAMBA,
+                    }[spec.indices_from_pool]
+                ][0]
+                if src.keys is not None:
+                    transfer.keys = src.keys
+            transfers.append(transfer)
+        return transfers
+
+    def _collect_storage_backup_pool_transfers(
+        self, node: UnifiedTreeNode
+    ) -> list[PoolTransfer]:
+        """Build extra_pools for H→Storage (host_indices + keys; no device_indices)."""
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        transfers: list[PoolTransfer] = []
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            built = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_STORAGE
+            )
+            if not built:
+                continue
+            for xfer in built:
+                if xfer.device_indices is not None:
+                    raise AssertionError(
+                        f"BACKUP_STORAGE transfer {xfer.name} must not set "
+                        "device_indices; use host_indices + keys."
+                    )
+            comp_xfers[comp.component_type] = built
+            transfers.extend(built)
+        transfers.extend(
+            self._build_sidecar_storage_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, comp_xfers
+            )
+        )
+        return transfers
+
+    def _collect_storage_prefetch_pool_transfers(
+        self, last_host_node: UnifiedTreeNode
+    ) -> list[PoolTransfer]:
+        """Build extra_pools for Storage→H (hit_policy; indices/keys filled later)."""
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        transfers: list[PoolTransfer] = []
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            built = comp.build_hicache_transfers(
+                last_host_node, CacheTransferPhase.PREFETCH
+            )
+            if not built:
+                continue
+            for xfer in built:
+                if xfer.device_indices is not None or xfer.host_indices is not None:
+                    raise AssertionError(
+                        f"PREFETCH transfer {xfer.name} must only set hit_policy "
+                        "at build time; host_indices/keys are filled by the controller."
+                    )
+            comp_xfers[comp.component_type] = built
+            transfers.extend(built)
+        transfers.extend(
+            self._build_sidecar_storage_transfers(
+                CacheTransferPhase.PREFETCH, comp_xfers
+            )
+        )
         return transfers
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
@@ -1797,26 +1909,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
-        kv_xfer = PoolTransfer(
-            name=PoolName.KV,
-            host_indices=host_value,
-        )
-
-        comp_xfers: dict[ComponentType, list] = {}
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            t = comp.build_hicache_transfers(
-                node, CacheTransferPhase.BACKUP_STORAGE
-            )
-            if t:
-                comp_xfers[comp.component_type] = t
-
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers
-        )
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
+        # KV anchor: operation.host_indices + operation.hash_value (v1/v2 resolve).
+        # extra_pools: SWA + DSV4 sidecars with host_indices + keys only.
+        aux_xfers = self._collect_storage_backup_pool_transfers(node)
 
         operation_id = cc.write_storage(
             host_value,
@@ -1984,25 +2079,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_host_node.release_host_all()
                 return
 
-        kv_xfer = PoolTransfer(
-            name=PoolName.KV,
-            host_indices=host_indices,
-        )
-        comp_xfers: dict[ComponentType, list] = {}
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            t = comp.build_hicache_transfers(
-                last_host_node, CacheTransferPhase.PREFETCH
-            )
-            if t:
-                comp_xfers[comp.component_type] = t
-
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
-        )
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
+        # KV anchor: operation.host_indices; hashes from prefetch hit query.
+        aux_xfers = self._collect_storage_prefetch_pool_transfers(last_host_node)
 
         operation = cc.prefetch(
             req_id,
@@ -2026,6 +2104,7 @@ class UnifiedRadixCache(BasePrefixCache):
         key: RadixKey,
         host_indices: torch.Tensor,
         hash_value,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> int:
         """Insert prefetched host data into the host tree.
         Returns matched_length (tokens that matched existing nodes)."""
@@ -2055,14 +2134,67 @@ class UnifiedRadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
-            new_node = UnifiedTreeNode(self.tree_components)
-            new_node.parent = node
-            new_node.key = key
-            new_node.component_data[ComponentType.FULL].host_value = host_indices.clone()
-            new_node.hash_value = hash_value
-            node.children[key.child_key(self.page_size)] = new_node
-            self._update_evictable_leaf_sets(new_node)
-            self._update_evictable_leaf_sets(node)
+            swa_host_indices = None
+            if ComponentType.SWA in self.components:
+                for transfer in pool_transfers or []:
+                    if transfer.name == PoolName.SWA and transfer.host_indices is not None:
+                        swa_host_indices = transfer.host_indices
+                        break
+
+            def add_child(
+                parent: UnifiedTreeNode,
+                child_key_value: RadixKey,
+                child_host_indices: torch.Tensor,
+                child_hash_value,
+                child_swa_host_indices: Optional[torch.Tensor] = None,
+            ) -> UnifiedTreeNode:
+                new_node = UnifiedTreeNode(self.tree_components)
+                new_node.parent = parent
+                new_node.key = child_key_value
+                new_node.component_data[ComponentType.FULL].host_value = (
+                    child_host_indices.clone()
+                )
+                new_node.hash_value = child_hash_value
+                if (
+                    child_swa_host_indices is not None
+                    and ComponentType.SWA in self.components
+                ):
+                    new_node.component_data[ComponentType.SWA].host_value = (
+                        child_swa_host_indices.clone()
+                    )
+                parent.children[child_key_value.child_key(self.page_size)] = new_node
+                self._update_evictable_leaf_sets(new_node)
+                self._update_evictable_leaf_sets(parent)
+                return new_node
+
+            if (
+                swa_host_indices is not None
+                and len(swa_host_indices) > 0
+                and len(swa_host_indices) < len(key)
+                and len(swa_host_indices) % self.page_size == 0
+            ):
+                tail_len = len(swa_host_indices)
+                prefix_len = len(key) - tail_len
+                parent_node = add_child(
+                    node,
+                    key[:prefix_len],
+                    host_indices[:prefix_len],
+                    hash_value[: prefix_len // self.page_size],
+                )
+                add_child(
+                    parent_node,
+                    key[prefix_len:],
+                    host_indices[prefix_len:],
+                    hash_value[prefix_len // self.page_size :],
+                    swa_host_indices,
+                )
+            else:
+                if swa_host_indices is not None and len(swa_host_indices) > len(key):
+                    unused_swa = swa_host_indices[: -len(key)]
+                    if len(unused_swa) > 0 and getattr(self, "swa_kv_pool_host", None):
+                        self.swa_kv_pool_host.free(unused_swa)
+                    swa_host_indices = swa_host_indices[-len(key) :]
+                add_child(node, key, host_indices, hash_value, swa_host_indices)
 
         return matched_length
 
@@ -2099,9 +2231,18 @@ class UnifiedRadixCache(BasePrefixCache):
             fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            operation.pool_transfers,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        if matched_length >= min_completed_tokens:
+            for transfer in operation.pool_transfers or []:
+                if (
+                    transfer.name == PoolName.SWA
+                    and transfer.host_indices is not None
+                    and getattr(self, "swa_kv_pool_host", None)
+                ):
+                    self.swa_kv_pool_host.free(transfer.host_indices)
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )

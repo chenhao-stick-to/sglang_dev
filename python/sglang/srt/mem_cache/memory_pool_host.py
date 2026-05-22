@@ -2488,6 +2488,14 @@ class HostPoolGroup:
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
 
+    def anchor_has_storage_payload(self) -> bool:
+        """True when the anchor host pool carries bytes for v1 L3 KV I/O."""
+        host_pool = self.anchor_entry.host_pool
+        return (
+            getattr(host_pool, "kv_buffer", None) is not None
+            and host_pool.get_ksize_per_token() > 0
+        )
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer

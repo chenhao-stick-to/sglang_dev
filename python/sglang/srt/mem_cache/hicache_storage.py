@@ -84,9 +84,20 @@ class PoolHitPolicy(str, Enum):
 class PoolTransfer:
     """Unified per-pool transfer descriptor for batch v2 interface.
 
-    device<->host path : host_indices + device_indices
-    host<->storage path: host_indices + keys
-    nodes_to_load      : evicted nodes this transfer covers
+    Field usage by phase (see ``CacheTransferPhase`` in tree_component.py):
+
+    - **D→H (``BACKUP_HOST``)**: ``device_indices`` required; ``host_indices``
+      filled by the controller after alloc. ``keys`` unused.
+    - **H→D (``LOAD_BACK``)**: ``host_indices`` required; ``device_indices``
+      filled by the controller. ``nodes_to_load`` optional. ``keys`` unused.
+    - **H→Storage (``BACKUP_STORAGE``)**: ``host_indices`` + ``keys`` (page
+      hashes). ``device_indices`` must be ``None``.
+    - **Storage→H (``PREFETCH``)**: ``hit_policy``; ``host_indices`` / ``keys``
+      filled after ``batch_exists_v2`` (and sidecar resolve). ``device_indices``
+      must be ``None``.
+
+    Sidecar pools may set only ``indices_from_pool``; the controller copies
+    ``host_indices`` / ``keys`` from the source pool at resolve time.
     """
 
     name: PoolName
@@ -107,26 +118,91 @@ class SidecarPoolSpec:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
+def expand_page_keys_for_host_pool(
+    page_keys: List[str],
+    kv_page_size: int,
+    host_page_size: int,
+) -> List[str]:
+    """Map tree/KV page hashes to a host pool with a different page size.
+
+    DeepSeek V4 uses a larger full-attention ``page_size`` than SWA; storage
+    keys are still chained at the KV page granularity, so each KV page hash is
+    replicated for every host page it covers.
+    """
+    if kv_page_size == host_page_size:
+        return page_keys
+    if kv_page_size <= 0 or host_page_size <= 0:
+        raise ValueError(
+            f"Invalid page sizes for storage key expansion: "
+            f"kv_page_size={kv_page_size}, host_page_size={host_page_size}"
+        )
+    if kv_page_size % host_page_size != 0:
+        raise ValueError(
+            f"KV page size ({kv_page_size}) must be a multiple of host page "
+            f"size ({host_page_size}) for storage key expansion."
+        )
+    ratio = kv_page_size // host_page_size
+    expanded: List[str] = []
+    for key in page_keys:
+        expanded.extend([key] * ratio)
+    return expanded
+
+
+def pool_page_boundary_to_kv_pages(
+    pool_boundary_pages: int, kv_page_size: int, host_page_size: int
+) -> int:
+    """Convert a longest-prefix boundary in host-pool pages to KV pages."""
+    if pool_boundary_pages <= 0:
+        return 0
+    if kv_page_size == host_page_size:
+        return pool_boundary_pages
+    ratio = kv_page_size // host_page_size
+    return pool_boundary_pages // ratio
+
+
 @dataclass
 class PoolTransferResult:
     """Tracks how many pages were successfully processed per pool."""
 
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
+    required_pool_hit_pages: Optional[dict[str, int]] = None
+    swa_window_pool_hits: Optional[dict[str, List[bool]]] = None
+    pool_token_ranges: Optional[dict[str, tuple[int, int]]] = None
+    effective_hit_pages: Optional[int] = None
 
     @classmethod
     def empty(cls) -> "PoolTransferResult":
-        return cls(0, {})
+        return cls(0, {}, {}, {}, {}, 0)
 
     def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
+        self.effective_hit_pages = self.kv_hit_pages
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
         """Record actual load/write success counts per extra pool."""
         self.extra_pool_hit_pages.update(
             {name: sum(rs) for name, rs in results.items()}
         )
+
+    def update_from_hit_result(self, result: "PoolTransferResult") -> None:
+        self.update_kv_hit_pages(result.kv_hit_pages)
+        self.extra_pool_hit_pages.update(result.extra_pool_hit_pages)
+        if result.required_pool_hit_pages:
+            if self.required_pool_hit_pages is None:
+                self.required_pool_hit_pages = {}
+            self.required_pool_hit_pages.update(result.required_pool_hit_pages)
+        if result.swa_window_pool_hits:
+            if self.swa_window_pool_hits is None:
+                self.swa_window_pool_hits = {}
+            self.swa_window_pool_hits.update(result.swa_window_pool_hits)
+        if result.pool_token_ranges:
+            if self.pool_token_ranges is None:
+                self.pool_token_ranges = {}
+            self.pool_token_ranges.update(result.pool_token_ranges)
+        if result.effective_hit_pages is not None:
+            self.effective_hit_pages = result.effective_hit_pages
 
 
 class HiCacheStorage(ABC):

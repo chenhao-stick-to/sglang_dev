@@ -19,12 +19,43 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    expand_page_keys_for_host_pool,
+    pool_page_boundary_to_kv_pages,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
+
+# DeepSeek V4 + hybrid SWA pools use batch v2 with per-pool key suffixes.
+_DSV4_V2_POOL_NAMES = frozenset(
+    {
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
+_DSV4_REQUIRED_PREFIX_POOL_NAMES = frozenset(
+    {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+    }
+)
+_DSV4_SWA_WINDOW_POOL_NAMES = frozenset(
+    {
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -550,13 +581,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self._v1_kv_storage_enabled = True
+        buffer = mem_pool_host.kv_buffer
+        if buffer is None or mem_pool_host.get_ksize_per_token() == 0:
+            # Logical anchor (e.g. DeepSeek V4 FULL): payload lives in v2 pools only.
+            self._v1_kv_storage_enabled = False
+            self.gb_per_page = 0.0
+            logger.info(
+                "Mooncake v1 KV registration skipped: anchor host pool has no "
+                "storage payload (hybrid v2-only path)."
+            )
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
             "page_head",
             "page_first_kv_split",
         ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
-        buffer = self.mem_pool_host.kv_buffer
         try:
             super().register_buffer(buffer)
         except TypeError as err:
@@ -565,6 +606,182 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def _anchor_has_storage_payload(self) -> bool:
+        return getattr(self, "_v1_kv_storage_enabled", True)
+
+    def _kv_page_size(self) -> int:
+        return getattr(self.mem_pool_host, "page_size", 1) or 1
+
+    def _is_deepseek_v4_storage(self) -> bool:
+        pools = getattr(self, "registered_pools", {})
+        return any(name in pools for name in _DSV4_REQUIRED_PREFIX_POOL_NAMES) or any(
+            name in pools
+            for name in _DSV4_SWA_WINDOW_POOL_NAMES
+            if name != PoolName.SWA
+        )
+
+    def _is_dsv4_required_prefix_pool(self, pool_name: PoolName) -> bool:
+        return self._is_deepseek_v4_storage() and (
+            pool_name in _DSV4_REQUIRED_PREFIX_POOL_NAMES
+        )
+
+    def _is_dsv4_swa_window_pool(self, pool_name: PoolName) -> bool:
+        return self._is_deepseek_v4_storage() and (
+            pool_name in _DSV4_SWA_WINDOW_POOL_NAMES
+        )
+
+    def _extra_dict(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> dict:
+        return getattr(extra_info, "extra_info", None) or {}
+
+    def _extra_token_ids(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[List[int]]:
+        token_ids = self._extra_dict(extra_info).get("token_ids")
+        return list(token_ids) if token_ids is not None else None
+
+    def _extra_prior_hash(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[str]:
+        extra = self._extra_dict(extra_info)
+        if extra.get("last_hash") is not None:
+            return extra["last_hash"]
+        prefix_keys = getattr(extra_info, "prefix_keys", None)
+        return prefix_keys[-1] if prefix_keys else None
+
+    def _pool_token_range(
+        self, transfer: PoolTransfer, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[tuple[int, int]]:
+        ranges = self._extra_dict(extra_info).get("pool_token_ranges") or {}
+        return ranges.get(transfer.name) or ranges.get(str(transfer.name))
+
+    def _page_keys_for_transfer(
+        self, kv_page_keys: List[str], transfer: PoolTransfer
+    ) -> List[str]:
+        pools = getattr(self, "registered_pools", {})
+        host_pool = pools.get(transfer.name)
+        if host_pool is None:
+            return kv_page_keys
+        return expand_page_keys_for_host_pool(
+            kv_page_keys,
+            self._kv_page_size(),
+            getattr(host_pool, "page_size", self._kv_page_size()) or 1,
+        )
+
+    def _dsv4_page_hashes_from_tokens(
+        self,
+        token_ids: List[int],
+        pool_page_size: int,
+        prior_hash: Optional[str],
+        chained: bool,
+    ) -> List[str]:
+        page_hashes: List[str] = []
+        last_hash = prior_hash
+        for start in range(0, len(token_ids), pool_page_size):
+            page_tokens = token_ids[start : start + pool_page_size]
+            if not page_tokens:
+                continue
+            if chained:
+                last_hash = get_hash_str(page_tokens, last_hash)
+                page_hashes.append(last_hash)
+            else:
+                page_hashes.append(get_hash_str(page_tokens, None))
+        return page_hashes
+
+    def _dsv4_storage_page_keys(
+        self,
+        kv_page_keys: List[str],
+        transfer: PoolTransfer,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[List[str]]:
+        if not (
+            self._is_dsv4_required_prefix_pool(transfer.name)
+            or self._is_dsv4_swa_window_pool(transfer.name)
+        ):
+            return None
+
+        token_ids = self._extra_token_ids(extra_info)
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        if token_ids is None or host_pool is None:
+            return None
+
+        kv_page_size = self._kv_page_size()
+        pool_page_size = getattr(host_pool, "page_size", kv_page_size) or kv_page_size
+        token_limit = min(len(token_ids), len(kv_page_keys) * kv_page_size)
+        token_ids = token_ids[:token_limit]
+
+        chained = self._is_dsv4_required_prefix_pool(transfer.name)
+        page_hashes = self._dsv4_page_hashes_from_tokens(
+            token_ids,
+            pool_page_size,
+            self._extra_prior_hash(extra_info) if chained else None,
+            chained,
+        )
+
+        token_range = self._pool_token_range(transfer, extra_info)
+        if token_range is None:
+            return page_hashes
+
+        start_token, end_token = token_range
+        start_page = max(0, start_token // pool_page_size)
+        end_page = max(start_page, (end_token + pool_page_size - 1) // pool_page_size)
+        return page_hashes[start_page:end_page]
+
+    def _legacy_storage_page_keys(
+        self,
+        kv_page_keys: List[str],
+        transfer: PoolTransfer,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[str]:
+        page_keys = self._page_keys_for_transfer(kv_page_keys, transfer)
+        token_range = self._pool_token_range(transfer, extra_info)
+        if token_range is None:
+            return page_keys
+
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        pool_page_size = (
+            getattr(host_pool, "page_size", self._kv_page_size())
+            if host_pool is not None
+            else self._kv_page_size()
+        )
+        start_token, end_token = token_range
+        start_page = max(0, start_token // pool_page_size)
+        end_page = max(start_page, (end_token + pool_page_size - 1) // pool_page_size)
+        return page_keys[start_page:end_page]
+
+    def _storage_page_keys_for_transfer(
+        self,
+        kv_page_keys: List[str],
+        transfer: PoolTransfer,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> List[str]:
+        return self._dsv4_storage_page_keys(kv_page_keys, transfer, extra_info) or (
+            self._legacy_storage_page_keys(kv_page_keys, transfer, extra_info)
+        )
+
+    def _pool_storage_base_tag(self, pool_name: PoolName) -> str:
+        if pool_name == PoolName.SWA:
+            return f"{self.mha_suffix}_swa"
+        return str(pool_name.value)
+
+    def _hybrid_pool_key_suffixes(self, transfer: PoolTransfer) -> List[str]:
+        name = transfer.name
+        if name not in _DSV4_V2_POOL_NAMES and name != PoolName.INDEXER:
+            return []
+        pools = getattr(self, "registered_pools", {})
+        host_pool = pools.get(name)
+        base_tag = self._pool_storage_base_tag(name)
+        rank_tag = self.mla_suffix if name != PoolName.SWA else self.mha_suffix
+        if isinstance(rank_tag, list):
+            rank_tag = rank_tag[0]
+        base_suffix = f"_{rank_tag}_{base_tag}"
+        layer_num = getattr(host_pool, "layer_num", 1) if host_pool is not None else 1
+        layout = getattr(host_pool, "layout", "page_first") if host_pool else "page_first"
+        if layout == "layer_first" and layer_num > 1:
+            return [f"{base_suffix}_L{i}" for i in range(layer_num)]
+        return [base_suffix]
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -590,8 +807,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
         # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page
+        # - INDEXER / DSV4 pools / SWA: one or more suffixes per host page
+        # - MAMBA: one temporal key + N conv keys per page
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
@@ -605,11 +822,141 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name in _DSV4_V2_POOL_NAMES:
+            suffixes = self._hybrid_pool_key_suffixes(transfer)
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]
         return component_keys, key_multiplier
+
+    def _page_exists_boundary(
+        self,
+        page_exists: List[bool],
+        transfer: PoolTransfer,
+        kv_pages: int,
+    ) -> int:
+        if not page_exists:
+            return 0
+        pools = getattr(self, "registered_pools", {})
+        host_pool = pools.get(transfer.name)
+        host_page_size = (
+            getattr(host_pool, "page_size", self._kv_page_size())
+            if host_pool is not None
+            else self._kv_page_size()
+        )
+        boundary_pool = 0
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            try:
+                boundary_pool = page_exists.index(False)
+            except ValueError:
+                boundary_pool = len(page_exists)
+        elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            trailing_kv = max(1, len(transfer.keys) if transfer.keys else 1)
+            kv_ps = self._kv_page_size()
+            if host_page_size < kv_ps:
+                trailing_pool = trailing_kv * (kv_ps // host_page_size)
+            else:
+                trailing_pool = trailing_kv
+            for prefix_len in range(len(page_exists), 0, -1):
+                if all(
+                    page_exists[i]
+                    for i in range(max(0, prefix_len - trailing_pool), prefix_len)
+                ):
+                    boundary_pool = prefix_len
+                    break
+        return pool_page_boundary_to_kv_pages(
+            min(boundary_pool, len(page_exists)),
+            self._kv_page_size(),
+            host_page_size,
+        )
+
+    def _component_page_exists(
+        self,
+        page_keys: List[str],
+        transfer: PoolTransfer,
+        legacy_page_keys: Optional[List[str]] = None,
+    ) -> tuple[List[bool], int]:
+        component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+            page_keys, transfer
+        )
+        if key_multiplier == 0 or not component_keys:
+            return [], 0
+
+        exists = self._batch_exist(self._tag_keys(component_keys))
+        page_exists = [
+            all(
+                r == 1
+                for r in exists[i * key_multiplier : (i + 1) * key_multiplier]
+            )
+            for i in range(len(page_keys))
+        ]
+
+        if legacy_page_keys is not None and len(legacy_page_keys) == len(page_keys):
+            missing_pages = [i for i, ok in enumerate(page_exists) if not ok]
+            if missing_pages:
+                legacy_component_keys, legacy_multiplier = (
+                    self._get_hybrid_page_component_keys(legacy_page_keys, transfer)
+                )
+                if legacy_multiplier == key_multiplier and legacy_component_keys:
+                    legacy_exists = self._batch_exist(
+                        self._tag_keys(legacy_component_keys)
+                    )
+                    for i in missing_pages:
+                        page_exists[i] = all(
+                            r == 1
+                            for r in legacy_exists[
+                                i * key_multiplier : (i + 1) * key_multiplier
+                            ]
+                        )
+
+        return page_exists, key_multiplier
+
+    def _dsv4_swa_window_range(
+        self,
+        candidate_pages: int,
+        sliding_window_size: Optional[int],
+    ) -> tuple[int, int]:
+        candidate_tokens = candidate_pages * self._kv_page_size()
+        if candidate_tokens <= 0:
+            return 0, 0
+        window_tokens = (
+            min(candidate_tokens, sliding_window_size)
+            if sliding_window_size and sliding_window_size > 0
+            else candidate_tokens
+        )
+        start = candidate_tokens - window_tokens
+        # Tree nodes are KV-page aligned. Pull a little extra SWA when needed so
+        # the host node can be split on the same boundary as the radix tree.
+        kv_page_size = self._kv_page_size()
+        start -= start % kv_page_size
+        return start, candidate_tokens
+
+    def _dsv4_window_ok(
+        self,
+        page_hits_by_pool: dict[PoolName, List[bool]],
+        candidate_pages: int,
+        sliding_window_size: Optional[int],
+    ) -> bool:
+        if not page_hits_by_pool:
+            return True
+        start_token, end_token = self._dsv4_swa_window_range(
+            candidate_pages, sliding_window_size
+        )
+        for pool_name, page_hits in page_hits_by_pool.items():
+            host_pool = getattr(self, "registered_pools", {}).get(pool_name)
+            pool_page_size = (
+                getattr(host_pool, "page_size", self._kv_page_size())
+                if host_pool is not None
+                else self._kv_page_size()
+            )
+            start_page = start_token // pool_page_size
+            end_page = (end_token + pool_page_size - 1) // pool_page_size
+            if end_page > len(page_hits):
+                return False
+            if not all(page_hits[start_page:end_page]):
+                return False
+        return True
 
     def batch_exists_v2(
         self,
@@ -618,64 +965,132 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        if self._anchor_has_storage_payload():
+            kv_pages = self.batch_exists(qkeys, extra_info)
+        else:
+            kv_pages = len(qkeys)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        required_hit_pages: dict[str, int] = {}
+        swa_window_hits: dict[str, List[bool]] = {}
+        pool_token_ranges: dict[str, tuple[int, int]] = {}
+        dsv4_mode = self._is_deepseek_v4_storage()
+        full_prefix_pages = kv_pages
+        swa_window_page_hits: dict[PoolName, List[bool]] = {}
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if full_prefix_pages == 0:
                 break
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+            source_keys = keys[:full_prefix_pages]
+            pool_page_keys = self._storage_page_keys_for_transfer(
+                source_keys, transfer, extra_info
             )
-            ex = self._batch_exist(component_keys)
-            if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
-            else:
-                page_exists = [False] * kv_pages
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
+            if not pool_page_keys:
+                continue
+            legacy_page_keys = None
+            if dsv4_mode and (
+                self._is_dsv4_required_prefix_pool(transfer.name)
+                or self._is_dsv4_swa_window_pool(transfer.name)
+            ):
+                legacy_page_keys = self._legacy_storage_page_keys(
+                    source_keys, transfer, extra_info
+                )
+            page_exists, key_multiplier = self._component_page_exists(
+                pool_page_keys, transfer, legacy_page_keys
+            )
+            if key_multiplier == 0:
+                continue
+
+            if dsv4_mode and self._is_dsv4_swa_window_pool(transfer.name):
+                swa_window_page_hits[transfer.name] = page_exists
+                swa_window_hits[str(transfer.name)] = page_exists
+                continue
+
+            boundary = self._page_exists_boundary(
+                page_exists, transfer, full_prefix_pages
+            )
             if boundary:
                 hit_count[transfer.name] = boundary
+            if dsv4_mode and self._is_dsv4_required_prefix_pool(transfer.name):
+                required_hit_pages[str(transfer.name)] = boundary
+            full_prefix_pages = min(full_prefix_pages, boundary)
             final_pages = min(final_pages, boundary)
 
-        return PoolTransferResult(final_pages, hit_count)
+        if dsv4_mode and full_prefix_pages > 0 and swa_window_page_hits:
+            sliding_window_size = self._extra_dict(extra_info).get(
+                "sliding_window_size"
+            )
+            final_pages = 0
+            for candidate_pages in range(full_prefix_pages, 0, -1):
+                if self._dsv4_window_ok(
+                    swa_window_page_hits, candidate_pages, sliding_window_size
+                ):
+                    final_pages = candidate_pages
+                    break
+            start_token, end_token = self._dsv4_swa_window_range(
+                final_pages, sliding_window_size
+            )
+            for pool_name in swa_window_page_hits:
+                pool_token_ranges[str(pool_name)] = (start_token, end_token)
+                hit_count[pool_name] = sum(swa_window_page_hits[pool_name])
+        else:
+            final_pages = full_prefix_pages
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+        final_tokens = final_pages * self._kv_page_size()
+        for transfer in pool_transfers or []:
+            if dsv4_mode and self._is_dsv4_required_prefix_pool(transfer.name):
+                pool_token_ranges[str(transfer.name)] = (0, final_tokens)
+
+        return PoolTransferResult(
+            final_pages,
+            hit_count,
+            required_pool_hit_pages=required_hit_pages,
+            swa_window_pool_hits=swa_window_hits,
+            pool_token_ranges=pool_token_ranges,
+            effective_hit_pages=final_pages,
+        )
+
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            if host_pool is None:
+                logger.warning(
+                    "Mooncake batch v2 skipped unregistered pool %s", transfer.name
+                )
+                continue
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
-            assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
+            assert keys is not None and len(keys) > 0
+            storage_keys = self._storage_page_keys_for_transfer(
+                keys, transfer, extra_info
+            )
+            assert len(storage_keys) == len(host_indices) // page_size, (
+                f"Pool {transfer.name}: storage keys ({len(storage_keys)}) must match "
+                f"host pages ({len(host_indices) // page_size})"
+            )
 
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                storage_keys, transfer
+            )
+            if key_multiplier == 0 or not key_strs:
+                logger.warning(
+                    "Mooncake batch v2 skipped pool %s: no storage key suffixes",
+                    transfer.name,
+                )
+                continue
+            assert len(key_strs) == len(ptr_list), (
+                f"Pool {transfer.name}: {len(key_strs)} keys vs {len(ptr_list)} buffers"
             )
             key_strs = self._tag_keys(key_strs)
 
@@ -691,13 +1106,51 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
+                results[transfer.name] = self._batch_postprocess(
+                    io_results, is_set_operate=True, key_multiplier=key_multiplier
+                )
             else:
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
-            results[transfer.name] = self._batch_postprocess(
-                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
-            )
+                page_results = self._batch_postprocess(
+                    io_results, is_set_operate=False, key_multiplier=key_multiplier
+                )
+                if self._is_deepseek_v4_storage() and any(
+                    not ok for ok in page_results
+                ):
+                    legacy_keys = self._legacy_storage_page_keys(
+                        keys, transfer, extra_info
+                    )
+                    if len(legacy_keys) == len(storage_keys):
+                        legacy_key_strs, legacy_multiplier = (
+                            self._get_hybrid_page_component_keys(
+                                legacy_keys, transfer
+                            )
+                        )
+                        if legacy_multiplier == key_multiplier and legacy_key_strs:
+                            legacy_key_strs = self._tag_keys(legacy_key_strs)
+                            failed_pages = [
+                                i for i, ok in enumerate(page_results) if not ok
+                            ]
+                            retry_component_idx = [
+                                i * key_multiplier + j
+                                for i in failed_pages
+                                for j in range(key_multiplier)
+                            ]
+                            retry_results = self._get_batch_zero_copy_impl(
+                                [legacy_key_strs[i] for i in retry_component_idx],
+                                [ptr_list[i] for i in retry_component_idx],
+                                [element_size_list[i] for i in retry_component_idx],
+                            )
+                            retry_pages = self._batch_postprocess(
+                                retry_results,
+                                is_set_operate=False,
+                                key_multiplier=key_multiplier,
+                            )
+                            for page_idx, ok in zip(failed_pages, retry_pages):
+                                page_results[page_idx] = ok
+                results[transfer.name] = page_results
         return results
 
     def batch_get_v2(
@@ -705,14 +1158,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False)
+        return self._batch_io_v2(transfers, is_set=False, extra_info=extra_info)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (

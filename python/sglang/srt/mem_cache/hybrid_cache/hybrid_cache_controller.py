@@ -26,6 +26,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    expand_page_keys_for_host_pool,
+    pool_page_boundary_to_kv_pages,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.utils import get_device_module
@@ -35,6 +37,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+_DSV4_REQUIRED_PREFIX_POOL_NAMES = frozenset(
+    {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+    }
+)
+_DSV4_SWA_WINDOW_POOL_NAMES = frozenset(
+    {
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
 
 
 class CacheOperation(BaseCacheOperation):
@@ -425,6 +443,34 @@ class HybridCacheController(BaseHiCacheController):
         self.backup_queue.put(operation)
         return operation.id
 
+    def _is_deepseek_v4_storage_pool(self, pool_name: PoolName) -> bool:
+        entry_map = getattr(self.mem_pool_host, "entry_map", {})
+        return pool_name in entry_map and (
+            pool_name in _DSV4_REQUIRED_PREFIX_POOL_NAMES
+            or pool_name in _DSV4_SWA_WINDOW_POOL_NAMES
+        )
+
+    def _is_deepseek_v4_storage_enabled(self) -> bool:
+        entry_map = getattr(self.mem_pool_host, "entry_map", {})
+        return any(name in entry_map for name in _DSV4_REQUIRED_PREFIX_POOL_NAMES)
+
+    def _storage_extra_info(self, operation) -> HiCacheStorageExtraInfo:
+        extra = {
+            "token_ids": list(operation.token_ids),
+            "last_hash": operation.last_hash,
+            "page_size": self.page_size,
+            "sliding_window_size": getattr(self, "sliding_window_size", None),
+        }
+        pool_token_ranges = getattr(
+            operation.pool_storage_result, "pool_token_ranges", None
+        )
+        if pool_token_ranges:
+            extra["pool_token_ranges"] = pool_token_ranges
+        return HiCacheStorageExtraInfo(
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
+            extra_info=extra,
+        )
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         hash_value = []
@@ -434,9 +480,7 @@ class HybridCacheController(BaseHiCacheController):
             )
             hash_value.append(last_hash)
 
-        extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
-        )
+        extra_info = self._storage_extra_info(operation)
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
@@ -448,7 +492,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
-        operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.update_from_hit_result(hit_result)
 
         if kv_hit_pages > 0 and operation.pool_transfers:
             self._sync_trailing_keys(operation.pool_transfers, hash_value, kv_hit_pages)
@@ -486,39 +530,227 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
+    def _anchor_has_storage_payload(self) -> bool:
+        mem_pool_host = self.mem_pool_host
+        if hasattr(mem_pool_host, "anchor_has_storage_payload"):
+            return mem_pool_host.anchor_has_storage_payload()
+        return (
+            getattr(mem_pool_host, "kv_buffer", None) is not None
+            and mem_pool_host.get_ksize_per_token() > 0
+        )
+
+    def _host_pool_page_size(self, pool_name: PoolName) -> int:
+        entry = getattr(self.mem_pool_host, "entry_map", {}).get(pool_name)
+        if entry is not None:
+            return entry.host_pool.page_size
+        return self.page_size
+
+    def _page_keys_for_host_pool(
+        self, page_keys: list[str], pool_name: PoolName
+    ) -> list[str]:
+        return expand_page_keys_for_host_pool(
+            page_keys,
+            self.page_size,
+            self._host_pool_page_size(pool_name),
+        )
+
+    def _dsv4_swa_window_token_range(self, total_tokens: int) -> tuple[int, int]:
+        sliding_window_size = getattr(self, "sliding_window_size", None)
+        if total_tokens <= 0:
+            return 0, 0
+        window_tokens = (
+            min(total_tokens, sliding_window_size)
+            if sliding_window_size and sliding_window_size > 0
+            else total_tokens
+        )
+        start = total_tokens - window_tokens
+        start -= start % self.page_size
+        return start, total_tokens
+
+    def _prepare_storage_prefetch_pool_transfers(self, operation) -> bool:
+        if not operation.pool_transfers:
+            return True
+        hit_tokens = len(operation.hash_value) * self.page_size
+        if hit_tokens <= 0:
+            return True
+
+        pool_token_ranges = (
+            getattr(operation.pool_storage_result, "pool_token_ranges", None) or {}
+        )
+        newly_allocated: list[tuple[Callable, torch.Tensor, PoolTransfer]] = []
+
+        def rollback() -> None:
+            for free_fn, indices, transfer in newly_allocated:
+                free_fn(indices)
+                transfer.host_indices = None
+
+        for transfer in operation.pool_transfers:
+            if transfer.indices_from_pool is not None:
+                continue
+            if transfer.host_indices is not None:
+                continue
+            if transfer.name not in _DSV4_SWA_WINDOW_POOL_NAMES:
+                continue
+            if not self._is_deepseek_v4_storage_enabled():
+                continue
+
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            token_range = self._dsv4_swa_window_token_range(hit_tokens)
+            pool_token_ranges[str(transfer.name)] = token_range
+            need_size = token_range[1] - token_range[0]
+            if need_size <= 0:
+                continue
+            indices = entry.host_pool.alloc(need_size)
+            if indices is None and entry.host_evict_fn:
+                entry.host_evict_fn(need_size)
+                indices = entry.host_pool.alloc(need_size)
+            if indices is None:
+                rollback()
+                return False
+            transfer.host_indices = indices
+            transfer.keys = operation.hash_value
+            newly_allocated.append((entry.host_pool.free, indices, transfer))
+
+        for transfer in operation.pool_transfers:
+            if transfer.indices_from_pool is None:
+                continue
+            source = next(
+                (
+                    t
+                    for t in operation.pool_transfers
+                    if t.indices_from_pool is None and t.name == transfer.indices_from_pool
+                ),
+                None,
+            )
+            if source is None:
+                continue
+            transfer.host_indices = source.host_indices
+            transfer.keys = source.keys or operation.hash_value
+            if str(source.name) in pool_token_ranges:
+                pool_token_ranges[str(transfer.name)] = pool_token_ranges[
+                    str(source.name)
+                ]
+
+        operation.pool_storage_result.pool_token_ranges = pool_token_ranges
+        return True
+
+    def _prefix_success_pages(
+        self, results: dict[str, list[bool]], transfer: PoolTransfer
+    ) -> int:
+        page_results = results.get(transfer.name, [])
+        boundary = 0
+        for ok in page_results:
+            if not ok:
+                break
+            boundary += 1
+        return pool_page_boundary_to_kv_pages(
+            boundary,
+            self.page_size,
+            self._host_pool_page_size(transfer.name),
+        )
+
+    def _completed_tokens_from_v2_results(
+        self,
+        operation,
+        results: dict[str, list[bool]],
+        *,
+        require_swa_window: bool,
+    ) -> int:
+        hit_pages = len(operation.hash_value) if operation.hash_value else (
+            len(operation.token_ids) // self.page_size
+        )
+        required_pages = hit_pages
+        saw_required = False
+        for transfer in operation.pool_transfers or []:
+            if transfer.name in _DSV4_REQUIRED_PREFIX_POOL_NAMES:
+                saw_required = True
+                required_pages = min(
+                    required_pages, self._prefix_success_pages(results, transfer)
+                )
+
+        if require_swa_window:
+            for transfer in operation.pool_transfers or []:
+                if transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES and transfer.name in results:
+                    if not all(results.get(transfer.name, [])):
+                        return 0
+
+        if not saw_required and not self._anchor_has_storage_payload():
+            required_pages = hit_pages
+        return required_pages * self.page_size
+
     def _page_transfer(self, operation):
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
+            if not self._prepare_storage_prefetch_pool_transfers(operation):
+                operation.mark_terminate()
+                return
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_get_v2(
+                operation.pool_transfers, self._storage_extra_info(operation)
+            )
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         # Transfer kv pools
-        super()._page_transfer(operation)
+        if self._anchor_has_storage_payload():
+            super()._page_transfer(operation)
+        elif not operation.is_terminated():
+            operation.completed_tokens = self._completed_tokens_from_v2_results(
+                operation,
+                results if operation.pool_transfers else {},
+                require_swa_window=True,
+            )
 
     def _page_backup(self, operation):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(
+                operation.pool_transfers, self._storage_extra_info(operation)
+            )
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         # Backup kv pools
-        super()._page_backup(operation)
+        if self._anchor_has_storage_payload():
+            super()._page_backup(operation)
+        else:
+            operation.completed_tokens = self._completed_tokens_from_v2_results(
+                operation,
+                results if operation.pool_transfers else {},
+                require_swa_window=False,
+            )
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
-        for transfer in operation.pool_transfers:
+        sources: dict[PoolName, tuple[torch.Tensor, Optional[list[str]]]] = {
+            PoolName.KV: (operation.host_indices, operation.hash_value),
+        }
+        for transfer in operation.pool_transfers or []:
+            if transfer.indices_from_pool is not None:
+                continue
+            if transfer.host_indices is None:
+                continue
+            keys = (
+                transfer.keys
+                if transfer.keys is not None
+                else operation.hash_value
+            )
+            sources[transfer.name] = (transfer.host_indices, keys)
+
+        for transfer in operation.pool_transfers or []:
             if transfer.indices_from_pool is None:
                 continue
-            if transfer.indices_from_pool != PoolName.KV:
-                # TODO(hzh): Support storage sidecar derived pools from other sources
-                raise AssertionError(
-                    "Storage sidecar derived pool currently only supports KV-shared "
-                    f"indices, got {transfer.name} from {transfer.indices_from_pool}."
-                )
-            transfer.host_indices = operation.host_indices
-            if transfer.keys is None:
-                transfer.keys = operation.hash_value
+            src_name = transfer.indices_from_pool
+            if src_name not in sources:
+                continue
+            host_indices, keys = sources[src_name]
+            transfer.host_indices = host_indices
+            if keys is None:
+                keys = operation.hash_value
+            if self._is_deepseek_v4_storage_pool(transfer.name):
+                transfer.keys = keys
+            else:
+                transfer.keys = self._page_keys_for_host_pool(keys, transfer.name)
 
     def _sync_trailing_keys(
         self,
