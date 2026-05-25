@@ -545,6 +545,9 @@ class Envs:
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    SGLANG_UNIFIED_RADIX_HICACHE_DEBUG = EnvBool(False)
+    SGLANG_UNIFIED_RADIX_HICACHE_DEBUG_MATCH = EnvBool(False)
+    SGLANG_UNIFIED_RADIX_HICACHE_DEBUG_REQ = EnvStr(None)
 
     # Breakable CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)

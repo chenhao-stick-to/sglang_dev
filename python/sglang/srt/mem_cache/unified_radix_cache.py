@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_radix_hicache_debug import log_hicache_event
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -1143,6 +1144,32 @@ class UnifiedRadixCache(BasePrefixCache):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
+
+        if self.cache_controller is not None:
+            log_hicache_event(
+                "L2",
+                "match_prefix",
+                node=result.best_match_node,
+                match=True,
+                extra={
+                    "device_tokens": len(result.device_indices),
+                    "host_hit_length": result.host_hit_length,
+                    "best_match_id": result.best_match_node.id,
+                    "last_device_id": result.last_device_node.id,
+                    "last_host_id": result.last_host_node.id,
+                },
+                also_log_path=True,
+                path_anchor=result.best_match_node,
+            )
+            if result.host_hit_length > 0:
+                log_hicache_event(
+                    "L2",
+                    "match_host_hit",
+                    node=result.last_host_node,
+                    match=True,
+                    extra={"host_hit_length": result.host_hit_length},
+                    path_anchor=result.last_host_node,
+                )
         return result
 
     def _split_node(
@@ -1588,9 +1615,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
+            log_hicache_event(
+                "L2",
+                "write_backup_skip_parent",
+                node=node,
+                extra={"write_back": write_back},
+            )
             return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        log_hicache_event(
+            "L2",
+            "write_backup_start",
+            node=node,
+            extra={"kv_tokens": len(device_value), "write_back": write_back},
+        )
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
         # Build aux transfers, keyed per component.
@@ -1620,6 +1659,12 @@ class UnifiedRadixCache(BasePrefixCache):
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
+            log_hicache_event(
+                "L2",
+                "write_backup_fail_alloc",
+                node=node,
+                extra={"kv_tokens": kv_tokens},
+            )
             return 0
 
         # Commit
@@ -1640,6 +1685,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self.ongoing_write_through[node.id] = (node, lock_params)
+        log_hicache_event(
+            "L2",
+            "write_backup_queued",
+            node=node,
+            extra={"host_tokens": len(host_indices), "node_id": node.id},
+        )
         return len(host_indices)
 
     def load_back(
@@ -1651,6 +1702,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
             return False
+
+        log_hicache_event(
+            "L2",
+            "load_back_start",
+            node=best_match_node,
+            extra={
+                "mem_quota": mem_quota,
+                "req_id": getattr(req, "rid", None) if req is not None else None,
+            },
+            req_id=getattr(req, "rid", None) if req is not None else None,
+        )
 
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
@@ -1682,6 +1744,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
+            log_hicache_event(
+                "L2",
+                "load_back_skip_threshold",
+                node=best_match_node,
+                extra={
+                    "kv_tokens": kv_tokens,
+                    "threshold": self.load_back_threshold,
+                    "mem_quota": mem_quota,
+                },
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
@@ -1690,6 +1762,12 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                log_hicache_event(
+                    "L2",
+                    "load_back_fail_evict",
+                    node=best_match_node,
+                    extra={"needed": needed, "evicted": result.num_tokens_evicted},
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 return False
 
@@ -1704,6 +1782,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            log_hicache_event(
+                "L2",
+                "load_back_fail_load",
+                node=best_match_node,
+                extra={"kv_tokens": kv_tokens},
+            )
             return False
 
         # Commit: each component gets only its own transfers
@@ -1724,6 +1808,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
+        )
+        log_hicache_event(
+            "L2",
+            "load_back_queued",
+            node=best_match_node,
+            extra={"device_tokens": len(device_indices)},
         )
         return True
 
@@ -1925,6 +2015,18 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host_all()
+        log_hicache_event(
+            "L3",
+            "write_backup_storage",
+            node=node,
+            extra={
+                "op_id": operation_id,
+                "host_tokens": len(host_value),
+                "num_hashes": len(node.hash_value) if node.hash_value else 0,
+                "prefix_keys": len(prefix_keys) if prefix_keys else 0,
+                "aux_pools": len(aux_xfers),
+            },
+        )
 
     # ---- HiCache: Async Event Management ----
 
@@ -1946,6 +2048,11 @@ class UnifiedRadixCache(BasePrefixCache):
                             if params is not None:
                                 self.dec_lock_ref(node, params)
                             if self.enable_storage:
+                                log_hicache_event(
+                                    "L2",
+                                    "write_through_done_write_back",
+                                    node=node,
+                                )
                                 self.write_backup_storage(node)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
@@ -1973,7 +2080,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 node, params = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(node, params)
                 if self.enable_storage:
+                    log_hicache_event(
+                        "L2",
+                        "write_through_done",
+                        node=node,
+                        extra={"ack_id": ack_id},
+                    )
                     self.write_backup_storage(node)
+                else:
+                    log_hicache_event(
+                        "L2",
+                        "write_through_done",
+                        node=node,
+                        extra={"ack_id": ack_id, "l3": False},
+                    )
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -1989,6 +2109,12 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
+                log_hicache_event(
+                    "L2",
+                    "load_back_done",
+                    node=node,
+                    extra={"ack_id": ack_id},
+                )
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -2004,6 +2130,19 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
         assert req is not None
         last_best_match_device_node = req.last_node
+        log_hicache_event(
+            "L2",
+            "init_load_back",
+            node=best_match_node,
+            req_id=getattr(req, "rid", None),
+            extra={
+                "host_hit_length": params.host_hit_length,
+                "evicted": best_match_node.evicted,
+                "last_device_id": last_best_match_device_node.id,
+                "mem_quota": mem_quota,
+            },
+            path_anchor=best_match_node,
+        )
 
         def _collect_new_prefix_indices() -> torch.Tensor:
             prefix_chunks: list[torch.Tensor] = []
@@ -2032,8 +2171,22 @@ class UnifiedRadixCache(BasePrefixCache):
                     len(new_indices),
                     best_match_node.id,
                 )
+                log_hicache_event(
+                    "L2",
+                    "init_load_back_success",
+                    node=best_match_node,
+                    req_id=getattr(req, "rid", None),
+                    extra={"loaded_tokens": len(new_indices)},
+                    path_anchor=best_match_node,
+                )
                 return new_indices, best_match_node
 
+        log_hicache_event(
+            "L2",
+            "init_load_back_noop",
+            node=best_match_node,
+            req_id=getattr(req, "rid", None),
+        )
         return (
             self._empty_match_result.device_indices,
             last_best_match_device_node,
@@ -2054,6 +2207,19 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.enable_storage or cc is None:
             return
 
+        log_hicache_event(
+            "L3",
+            "prefetch_start",
+            node=last_host_node,
+            req_id=req_id,
+            extra={
+                "input_tokens": len(new_input_tokens),
+                "last_hash": (last_hash[:16] + "...") if last_hash else None,
+                "prefix_keys": len(prefix_keys) if prefix_keys else 0,
+            },
+            path_anchor=last_host_node,
+        )
+
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=last_host_node.key.extra_key if last_host_node.key else None,
@@ -2064,6 +2230,17 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_length < self.prefetch_threshold
             or cc.prefetch_rate_limited()
         ):
+            log_hicache_event(
+                "L3",
+                "prefetch_skip",
+                node=last_host_node,
+                req_id=req_id,
+                extra={
+                    "prefetch_length": prefetch_length,
+                    "threshold": self.prefetch_threshold,
+                    "rate_limited": cc.prefetch_rate_limited(),
+                },
+            )
             return
 
         last_host_node.protect_host_all()
@@ -2080,6 +2257,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices = cc.mem_pool_host.alloc(prefetch_length)
             else:
                 last_host_node.release_host_all()
+                log_hicache_event(
+                    "L3",
+                    "prefetch_skip_host_oom",
+                    node=last_host_node,
+                    req_id=req_id,
+                )
                 return
 
         # KV anchor: operation.host_indices; hashes from prefetch hit query.
@@ -2100,6 +2283,18 @@ class UnifiedRadixCache(BasePrefixCache):
             operation,
         )
         cc.prefetch_tokens_occupied += len(prefetch_key)
+        log_hicache_event(
+            "L3",
+            "prefetch_queued",
+            node=last_host_node,
+            req_id=req_id,
+            extra={
+                "prefetch_tokens": len(prefetch_key),
+                "host_indices": len(host_indices),
+                "aux_pools": len(aux_xfers),
+            },
+            path_anchor=last_host_node,
+        )
 
     def _insert_helper_host(
         self,
@@ -2256,6 +2451,20 @@ class UnifiedRadixCache(BasePrefixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
+        log_hicache_event(
+            "L3",
+            "prefetch_done",
+            node=last_host_node,
+            req_id=req_id,
+            extra={
+                "completed_tokens": completed_tokens,
+                "min_completed_tokens": min_completed_tokens,
+                "matched_length": matched_length,
+                "loaded_from_storage": loaded_from_storage,
+            },
+            path_anchor=last_host_node,
+        )
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
@@ -2397,6 +2606,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, prefetch_key, host_indices, _operation = info
+                    log_hicache_event(
+                        "L3",
+                        "prefetch_revoke",
+                        node=last_host_node,
+                        req_id=req_id,
+                        extra={"prefetch_key_len": len(prefetch_key)},
+                        path_anchor=last_host_node,
+                    )
                     last_host_node.release_host_all()
                     cc.prefetch_tokens_occupied -= len(prefetch_key)
                     if cc.prefetch_tokens_occupied < 0:
@@ -2407,6 +2624,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
+                    log_hicache_event(
+                        "L3",
+                        "backup_storage_done",
+                        node=entry,
+                        extra={
+                            "ack_id": ack_id,
+                            "completed_tokens": operation.completed_tokens,
+                        },
+                        path_anchor=entry,
+                    )
                     entry.release_host_all()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
