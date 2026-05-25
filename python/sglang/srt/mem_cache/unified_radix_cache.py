@@ -2000,17 +2000,23 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        last_hash = node.parent.get_last_hash_value() if node.parent is not None else None
 
         host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
         # KV anchor: operation.host_indices + operation.hash_value (v1/v2 resolve).
         # extra_pools: SWA + DSV4 sidecars with host_indices + keys only.
         aux_xfers = self._collect_storage_backup_pool_transfers(node)
+        if aux_xfers and not isinstance(cc, HybridCacheController):
+            raise RuntimeError(
+                "UnifiedRadixCache L3 extra storage pools require HybridCacheController."
+            )
 
         operation_id = cc.write_storage(
             host_value,
             node.key.token_ids[: len(node.key)],
             node.hash_value,
             prefix_keys,
+            last_hash=last_hash,
             extra_pools=aux_xfers or None,
         )
         self.ongoing_backup[operation_id] = node
@@ -2254,7 +2260,18 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
                 new_input_tokens = new_input_tokens[:prefetch_length]
+                prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = cc.mem_pool_host.alloc(prefetch_length)
+                if host_indices is None:
+                    last_host_node.release_host_all()
+                    log_hicache_event(
+                        "L3",
+                        "prefetch_skip_host_oom",
+                        node=last_host_node,
+                        req_id=req_id,
+                        extra={"prefetch_length": prefetch_length},
+                    )
+                    return
             else:
                 last_host_node.release_host_all()
                 log_hicache_event(

@@ -24,6 +24,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolTransfer,
 )
 
 if TYPE_CHECKING:
@@ -852,6 +853,7 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
@@ -1054,12 +1056,18 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        last_hash: Optional[str] = None,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            last_hash=last_hash,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
         )
         self.backup_queue.put(operation)
         return operation.id

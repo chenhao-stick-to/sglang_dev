@@ -712,6 +712,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         token_limit = min(len(token_ids), len(kv_page_keys) * kv_page_size)
         token_ids = token_ids[:token_limit]
 
+        # DeepSeek V4 stores two kinds of objects:
+        # - required prefix pools (C4/C4 indexer/C128) are chained from the
+        #   prefix prior hash and must all exist from page 0 to the accepted
+        #   prefix boundary.
+        # - SWA and state pools are window-local; their hashes intentionally do
+        #   not include the full-prefix chain and are sliced by pool_token_ranges.
         chained = self._is_dsv4_required_prefix_pool(transfer.name)
         page_hashes = self._dsv4_page_hashes_from_tokens(
             token_ids,
@@ -1041,6 +1047,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if dsv4_mode and self._is_dsv4_required_prefix_pool(transfer.name):
                 pool_token_ranges[str(transfer.name)] = (0, final_tokens)
+
+        if dsv4_mode and envs.SGLANG_UNIFIED_RADIX_HICACHE_DEBUG.get():
+            logger.info(
+                "[UnifiedRadixHiCache] [L3] batch_exists_v2 "
+                "candidate_pages=%d kv_pages=%d final_pages=%d "
+                "hit_count=%s required_hits=%s window_hits=%s window_ranges=%s",
+                len(keys),
+                kv_pages,
+                final_pages,
+                hit_count,
+                required_hit_pages,
+                swa_window_hits,
+                pool_token_ranges,
+            )
 
         return PoolTransferResult(
             final_pages,

@@ -431,11 +431,13 @@ class HybridCacheController(BaseHiCacheController):
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        last_hash: Optional[str] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
             token_ids,
+            last_hash=last_hash,
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
@@ -597,7 +599,9 @@ class HybridCacheController(BaseHiCacheController):
             entry = self.mem_pool_host.entry_map.get(transfer.name)
             if entry is None:
                 continue
-            token_range = self._dsv4_swa_window_token_range(hit_tokens)
+            token_range = pool_token_ranges.get(str(transfer.name))
+            if token_range is None:
+                token_range = self._dsv4_swa_window_token_range(hit_tokens)
             pool_token_ranges[str(transfer.name)] = token_range
             need_size = token_range[1] - token_range[0]
             if need_size <= 0:
