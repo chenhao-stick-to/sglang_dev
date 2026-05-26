@@ -557,17 +557,9 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def _dsv4_swa_window_token_range(self, total_tokens: int) -> tuple[int, int]:
-        sliding_window_size = getattr(self, "sliding_window_size", None)
         if total_tokens <= 0:
             return 0, 0
-        window_tokens = (
-            min(total_tokens, sliding_window_size)
-            if sliding_window_size and sliding_window_size > 0
-            else total_tokens
-        )
-        start = total_tokens - window_tokens
-        start -= start % self.page_size
-        return start, total_tokens
+        return 0, total_tokens
 
     def _prepare_storage_prefetch_pool_transfers(self, operation) -> bool:
         if not operation.pool_transfers:
@@ -674,9 +666,27 @@ class HybridCacheController(BaseHiCacheController):
                     required_pages, self._prefix_success_pages(results, transfer)
                 )
 
-        if require_swa_window:
+        if self._is_deepseek_v4_storage_enabled():
+            saw_window = False
+            window_pages = required_pages
             for transfer in operation.pool_transfers or []:
-                if transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES and transfer.name in results:
+                if (
+                    transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES
+                    and transfer.name in results
+                ):
+                    saw_window = True
+                    window_pages = min(
+                        window_pages,
+                        self._prefix_success_pages(results, transfer),
+                    )
+            if saw_window:
+                required_pages = min(required_pages, window_pages)
+        elif require_swa_window:
+            for transfer in operation.pool_transfers or []:
+                if (
+                    transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES
+                    and transfer.name in results
+                ):
                     if not all(results.get(transfer.name, [])):
                         return 0
 

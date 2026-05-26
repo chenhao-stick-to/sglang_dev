@@ -60,6 +60,18 @@ _DSV4_SWA_WINDOW_POOL_NAMES = frozenset(
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _PoolIOPlan:
+    transfer: PoolTransfer
+    host_pool: HostKVCache
+    page_size: int
+    storage_keys: List[str]
+    key_strs: List[str]
+    ptr_list: List[int]
+    element_size_list: List[int]
+    key_multiplier: int
+
+
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
         super().__init__()
@@ -717,7 +729,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         #   prefix prior hash and must all exist from page 0 to the accepted
         #   prefix boundary.
         # - SWA and state pools are window-local; their hashes intentionally do
-        #   not include the full-prefix chain and are sliced by pool_token_ranges.
+        #   not include the full-prefix chain and must exist for every
+        #   swa_page_size subpage covered by the accepted prefix boundary.
         chained = self._is_dsv4_required_prefix_pool(transfer.name)
         page_hashes = self._dsv4_page_hashes_from_tokens(
             token_ids,
@@ -918,52 +931,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         return page_exists, key_multiplier
 
-    def _dsv4_swa_window_range(
-        self,
-        candidate_pages: int,
-        sliding_window_size: Optional[int],
-    ) -> tuple[int, int]:
-        candidate_tokens = candidate_pages * self._kv_page_size()
-        if candidate_tokens <= 0:
-            return 0, 0
-        window_tokens = (
-            min(candidate_tokens, sliding_window_size)
-            if sliding_window_size and sliding_window_size > 0
-            else candidate_tokens
-        )
-        start = candidate_tokens - window_tokens
-        # Tree nodes are KV-page aligned. Pull a little extra SWA when needed so
-        # the host node can be split on the same boundary as the radix tree.
-        kv_page_size = self._kv_page_size()
-        start -= start % kv_page_size
-        return start, candidate_tokens
-
-    def _dsv4_window_ok(
-        self,
-        page_hits_by_pool: dict[PoolName, List[bool]],
-        candidate_pages: int,
-        sliding_window_size: Optional[int],
-    ) -> bool:
-        if not page_hits_by_pool:
-            return True
-        start_token, end_token = self._dsv4_swa_window_range(
-            candidate_pages, sliding_window_size
-        )
-        for pool_name, page_hits in page_hits_by_pool.items():
-            host_pool = getattr(self, "registered_pools", {}).get(pool_name)
-            pool_page_size = (
-                getattr(host_pool, "page_size", self._kv_page_size())
-                if host_pool is not None
-                else self._kv_page_size()
-            )
-            start_page = start_token // pool_page_size
-            end_page = (end_token + pool_page_size - 1) // pool_page_size
-            if end_page > len(page_hits):
-                return False
-            if not all(page_hits[start_page:end_page]):
-                return False
-        return True
-
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -983,9 +950,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_token_ranges: dict[str, tuple[int, int]] = {}
         dsv4_mode = self._is_deepseek_v4_storage()
         full_prefix_pages = kv_pages
-        swa_window_page_hits: dict[PoolName, List[bool]] = {}
 
-        for transfer in pool_transfers or []:
+        transfers = pool_transfers or []
+        if dsv4_mode:
+            transfers = sorted(
+                transfers,
+                key=lambda transfer: (
+                    0
+                    if self._is_dsv4_required_prefix_pool(transfer.name)
+                    else 2
+                    if self._is_dsv4_swa_window_pool(transfer.name)
+                    else 1
+                ),
+            )
+
+        for transfer in transfers:
             if full_prefix_pages == 0:
                 break
             source_keys = keys[:full_prefix_pages]
@@ -1009,9 +988,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 continue
 
             if dsv4_mode and self._is_dsv4_swa_window_pool(transfer.name):
-                swa_window_page_hits[transfer.name] = page_exists
                 swa_window_hits[str(transfer.name)] = page_exists
-                continue
 
             boundary = self._page_exists_boundary(
                 page_exists, transfer, full_prefix_pages
@@ -1023,29 +1000,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             full_prefix_pages = min(full_prefix_pages, boundary)
             final_pages = min(final_pages, boundary)
 
-        if dsv4_mode and full_prefix_pages > 0 and swa_window_page_hits:
-            sliding_window_size = self._extra_dict(extra_info).get(
-                "sliding_window_size"
-            )
-            final_pages = 0
-            for candidate_pages in range(full_prefix_pages, 0, -1):
-                if self._dsv4_window_ok(
-                    swa_window_page_hits, candidate_pages, sliding_window_size
-                ):
-                    final_pages = candidate_pages
-                    break
-            start_token, end_token = self._dsv4_swa_window_range(
-                final_pages, sliding_window_size
-            )
-            for pool_name in swa_window_page_hits:
-                pool_token_ranges[str(pool_name)] = (start_token, end_token)
-                hit_count[pool_name] = sum(swa_window_page_hits[pool_name])
-        else:
-            final_pages = full_prefix_pages
+        final_pages = full_prefix_pages
 
         final_tokens = final_pages * self._kv_page_size()
         for transfer in pool_transfers or []:
-            if dsv4_mode and self._is_dsv4_required_prefix_pool(transfer.name):
+            if dsv4_mode and (
+                self._is_dsv4_required_prefix_pool(transfer.name)
+                or self._is_dsv4_swa_window_pool(transfer.name)
+            ):
                 pool_token_ranges[str(transfer.name)] = (0, final_tokens)
 
         if dsv4_mode and envs.SGLANG_UNIFIED_RADIX_HICACHE_DEBUG.get():
@@ -1071,7 +1033,196 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             effective_hit_pages=final_pages,
         )
 
+    def _should_use_dsv4_grouped_io(self, transfers: List[PoolTransfer]) -> bool:
+        if not self._is_deepseek_v4_storage():
+            return False
+        return any(
+            transfer.name in _DSV4_REQUIRED_PREFIX_POOL_NAMES
+            or transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES
+            for transfer in transfers
+        )
+
+    def _build_pool_io_plan(
+        self,
+        transfer: PoolTransfer,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[_PoolIOPlan]:
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        if host_pool is None:
+            logger.warning(
+                "Mooncake batch v2 skipped unregistered pool %s", transfer.name
+            )
+            return None
+        keys = transfer.keys
+        host_indices = transfer.host_indices
+        assert keys is not None and len(keys) > 0
+        assert host_indices is not None
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        storage_keys = self._storage_page_keys_for_transfer(
+            keys, transfer, extra_info
+        )
+        assert len(storage_keys) == len(host_indices) // page_size, (
+            f"Pool {transfer.name}: storage keys ({len(storage_keys)}) must match "
+            f"host pages ({len(host_indices) // page_size})"
+        )
+
+        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+            storage_keys, transfer
+        )
+        if key_multiplier == 0 or not key_strs:
+            logger.warning(
+                "Mooncake batch v2 skipped pool %s: no storage key suffixes",
+                transfer.name,
+            )
+            return None
+        assert len(key_strs) == len(ptr_list), (
+            f"Pool {transfer.name}: {len(key_strs)} keys vs {len(ptr_list)} buffers"
+        )
+        return _PoolIOPlan(
+            transfer=transfer,
+            host_pool=host_pool,
+            page_size=page_size,
+            storage_keys=storage_keys,
+            key_strs=self._tag_keys(key_strs),
+            ptr_list=ptr_list,
+            element_size_list=element_size_list,
+            key_multiplier=key_multiplier,
+        )
+
+    @staticmethod
+    def _plan_page_slice(plan: _PoolIOPlan, page_idx: int) -> slice:
+        start = page_idx * plan.key_multiplier
+        return slice(start, start + plan.key_multiplier)
+
+    def _plan_kv_page_slice(
+        self, plan: _PoolIOPlan, kv_page_idx: int
+    ) -> tuple[slice, int, int]:
+        kv_page_size = self._kv_page_size()
+        if kv_page_size % plan.page_size != 0:
+            raise ValueError(
+                f"KV page size ({kv_page_size}) must be a multiple of pool page "
+                f"size ({plan.page_size}) for DeepSeek V4 grouped I/O."
+            )
+        pages_per_kv_page = kv_page_size // plan.page_size
+        pool_start = kv_page_idx * pages_per_kv_page
+        pool_end = pool_start + pages_per_kv_page
+        component_start = pool_start * plan.key_multiplier
+        component_end = pool_end * plan.key_multiplier
+        return slice(component_start, component_end), pool_start, pool_end
+
+    def _io_dsv4_pools_grouped(
+        self,
+        plans: List[_PoolIOPlan],
+        is_set: bool,
+    ) -> dict:
+        results = {
+            plan.transfer.name: [False] * len(plan.storage_keys) for plan in plans
+        }
+        if not plans:
+            return results
+
+        max_pages = min(
+            pool_page_boundary_to_kv_pages(
+                len(plan.storage_keys), self._kv_page_size(), plan.page_size
+            )
+            for plan in plans
+        )
+        for kv_page_idx in range(max_pages):
+            key_strs: List[str] = []
+            ptrs: List[int] = []
+            sizes: List[int] = []
+            spans: List[tuple[_PoolIOPlan, int, int, int, int]] = []
+            for plan in plans:
+                page_slice, pool_start, pool_end = self._plan_kv_page_slice(
+                    plan, kv_page_idx
+                )
+                start = len(key_strs)
+                key_strs.extend(plan.key_strs[page_slice])
+                ptrs.extend(plan.ptr_list[page_slice])
+                sizes.extend(plan.element_size_list[page_slice])
+                spans.append((plan, start, len(key_strs), pool_start, pool_end))
+
+            if is_set:
+                exist_result = self._batch_exist(key_strs)
+                io_results = [0 if state == 1 else -1 for state in exist_result]
+                missing_idx = [
+                    i for i, state in enumerate(exist_result) if state != 1
+                ]
+                if missing_idx:
+                    put_results = self._put_batch_zero_copy_impl(
+                        [key_strs[i] for i in missing_idx],
+                        [ptrs[i] for i in missing_idx],
+                        [sizes[i] for i in missing_idx],
+                    )
+                    for i, res in zip(missing_idx, put_results):
+                        io_results[i] = res
+                success_fn = lambda group: all(res == 0 for res in group)
+            else:
+                io_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
+                success_fn = lambda group: all(res > 0 for res in group)
+
+            page_ok_by_plan = {
+                plan.transfer.name: success_fn(io_results[start:end])
+                for plan, start, end, _pool_start, _pool_end in spans
+            }
+            if not all(page_ok_by_plan.values()):
+                break
+            for plan, _start, _end, pool_start, pool_end in spans:
+                results[plan.transfer.name][pool_start:pool_end] = [True] * (
+                    pool_end - pool_start
+                )
+        return results
+
+    def _batch_io_v2_dsv4_grouped(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        results: dict = {}
+        dsv4_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.name in _DSV4_REQUIRED_PREFIX_POOL_NAMES
+            or transfer.name in _DSV4_SWA_WINDOW_POOL_NAMES
+        ]
+        other_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.name not in _DSV4_REQUIRED_PREFIX_POOL_NAMES
+            and transfer.name not in _DSV4_SWA_WINDOW_POOL_NAMES
+        ]
+
+        dsv4_plans = [
+            plan
+            for plan in (
+                self._build_pool_io_plan(transfer, extra_info)
+                for transfer in dsv4_transfers
+            )
+            if plan is not None
+        ]
+        if dsv4_plans:
+            results.update(self._io_dsv4_pools_grouped(dsv4_plans, is_set))
+
+        if other_transfers:
+            results.update(
+                self._batch_io_v2_default(other_transfers, is_set, extra_info)
+            )
+        return results
+
     def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
+        if self._should_use_dsv4_grouped_io(transfers):
+            return self._batch_io_v2_dsv4_grouped(transfers, is_set, extra_info)
+
+        return self._batch_io_v2_default(transfers, is_set, extra_info)
+
+    def _batch_io_v2_default(
         self,
         transfers: List[PoolTransfer],
         is_set: bool,

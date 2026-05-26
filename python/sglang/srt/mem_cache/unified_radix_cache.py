@@ -1570,8 +1570,24 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                self.write_backup(node, write_back=True)
-                self._evict_to_host(node, tracker)
+                if self.write_backup(node, write_back=True) > 0 and node.backuped:
+                    self._evict_to_host(node, tracker)
+                    return
+                log_hicache_event(
+                    "L2",
+                    "evict_device_leaf_skip_host_demote",
+                    node=node,
+                    extra={"reason": "write_backup_incomplete"},
+                )
+                for comp in self._components_tuple:
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.ALL, tracker=tracker
+                    )
+                self.evictable_device_leaves.discard(node)
+                parent = node.parent
+                self._remove_leaf_from_parent(node)
+                self._update_evictable_leaf_sets(parent)
+                self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
@@ -1623,7 +1639,30 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             return 0
 
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        full_cd = node.component_data[BASE_COMPONENT_TYPE]
+        device_value = full_cd.value
+        if device_value is None:
+            log_hicache_event(
+                "L2",
+                "write_backup_skip_incomplete_full",
+                node=node,
+                extra={"write_back": write_back},
+            )
+            return 0
+        if ComponentType.SWA in node.tree_components:
+            swa_value = node.component_data[ComponentType.SWA].value
+            if swa_value is None or len(swa_value) != len(device_value):
+                log_hicache_event(
+                    "L2",
+                    "write_backup_skip_incomplete_swa",
+                    node=node,
+                    extra={
+                        "full_tokens": len(device_value),
+                        "swa_tokens": len(swa_value) if swa_value is not None else 0,
+                        "write_back": write_back,
+                    },
+                )
+                return 0
         log_hicache_event(
             "L2",
             "write_backup_start",
@@ -2010,6 +2049,35 @@ class UnifiedRadixCache(BasePrefixCache):
             raise RuntimeError(
                 "UnifiedRadixCache L3 extra storage pools require HybridCacheController."
             )
+        if isinstance(cc, HybridCacheController):
+            entry_map = getattr(getattr(cc, "mem_pool_host", None), "entry_map", {})
+            dsv4_pools = {
+                PoolName.DEEPSEEK_V4_C4,
+                PoolName.DEEPSEEK_V4_C4_INDEXER,
+                PoolName.DEEPSEEK_V4_C128,
+                PoolName.SWA,
+                PoolName.DEEPSEEK_V4_C4_STATE,
+                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                PoolName.DEEPSEEK_V4_C128_STATE,
+            }
+            registered_dsv4_pools = dsv4_pools.intersection(entry_map)
+            transfer_pools = {transfer.name for transfer in aux_xfers}
+            if registered_dsv4_pools and not registered_dsv4_pools.issubset(
+                transfer_pools
+            ):
+                log_hicache_event(
+                    "L3",
+                    "write_backup_storage_skip_partial_dsv4",
+                    node=node,
+                    extra={
+                        "missing_pools": sorted(
+                            str(pool)
+                            for pool in registered_dsv4_pools - transfer_pools
+                        ),
+                        "present_pools": sorted(str(pool) for pool in transfer_pools),
+                    },
+                )
+                return
 
         operation_id = cc.write_storage(
             host_value,
