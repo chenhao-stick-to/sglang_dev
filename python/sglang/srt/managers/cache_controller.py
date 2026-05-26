@@ -496,11 +496,29 @@ class HiCacheController:
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
+        logger.info(
+            "[HiCache] Attaching storage backend '%s' "
+            "(tp_rank=%s, pp_rank=%s, is_mla=%s, backup_skip=%s)",
+            storage_backend,
+            getattr(self.storage_config, "tp_rank", "?"),
+            getattr(self.storage_config, "pp_rank", "?"),
+            getattr(self.storage_config, "is_mla_model", "?"),
+            self.backup_skip,
+        )
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
+            logger.info(
+                "[HiCache] Storage backend '%s' created: %s",
+                storage_backend,
+                type(self.storage_backend).__name__,
+            )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            logger.info(
+                "[HiCache] register_mem_pool_host done for anchor pool: %s",
+                type(self.mem_pool_host).__name__,
+            )
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -531,9 +549,16 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            logger.info(
+                "[HiCache] Storage I/O functions selected: get=%s set=%s",
+                getattr(self.page_get_func, "__name__", repr(self.page_get_func)),
+                getattr(self.page_set_func, "__name__", repr(self.page_set_func)),
+            )
+
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
+            logger.info("[HiCache] Storage background threads started.")
         except Exception:
             # Best-effort cleanup for partial init.
             try:

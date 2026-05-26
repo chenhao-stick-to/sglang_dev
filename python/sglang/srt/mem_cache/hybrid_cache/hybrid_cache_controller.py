@@ -237,8 +237,22 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
         )
 
-        for entry in host_pools or []:
+        pools_to_register = host_pools or []
+        logger.info(
+            "[HybridCache] Registering %d v2 host pools with storage backend '%s': %s",
+            len(pools_to_register),
+            storage_backend,
+            [str(e.name) for e in pools_to_register],
+        )
+        for entry in pools_to_register:
+            logger.info(
+                "[HybridCache] register_mem_host_pool_v2: pool=%s host_pool_type=%s",
+                entry.name,
+                type(entry.host_pool).__name__,
+            )
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            logger.info("[HybridCache] register_mem_host_pool_v2 done: pool=%s", entry.name)
+        logger.info("[HybridCache] All v2 pool registrations complete.")
 
     def reset(self):
         super().reset()

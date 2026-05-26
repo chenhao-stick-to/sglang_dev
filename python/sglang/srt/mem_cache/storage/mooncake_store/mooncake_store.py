@@ -603,6 +603,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "Mooncake v1 KV registration skipped: anchor host pool has no "
                 "storage payload (hybrid v2-only path)."
             )
+            logger.info(
+                "[Mooncake] register_mem_pool_host: v2-only mode, anchor=%s "
+                "ksize_per_token=%s kv_buffer_is_none=%s",
+                type(mem_pool_host).__name__,
+                mem_pool_host.get_ksize_per_token(),
+                buffer is None,
+            )
             return
         assert self.mem_pool_host.layout in [
             "page_first",
@@ -618,6 +625,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+        logger.info(
+            "[Mooncake] register_mem_pool_host: v1 KV anchor registered OK "
+            "pool=%s layout=%s page_size=%d gb_per_page=%.4f",
+            type(mem_pool_host).__name__,
+            mem_pool_host.layout,
+            mem_pool_host.page_size,
+            self.gb_per_page,
+        )
 
     def _anchor_has_storage_payload(self) -> bool:
         return getattr(self, "_v1_kv_storage_enabled", True)
@@ -814,8 +829,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Hybrid pools expose the tensors that Mooncake needs for zero-copy I/O.
         # The storage backend only depends on this accessor, not concrete fields.
         buf_list = host_pool.get_hybrid_pool_buffer()
-        for buf in buf_list:
+        logger.info(
+            "[Mooncake] register_mem_host_pool_v2: pool=%s buffers=%d "
+            "host_pool_type=%s page_size=%s",
+            host_pool_name,
+            len(buf_list),
+            type(host_pool).__name__,
+            getattr(host_pool, "page_size", "?"),
+        )
+        for i, buf in enumerate(buf_list):
+            buf_bytes = buf.numel() * buf.element_size()
+            logger.info(
+                "[Mooncake]   buffer[%d]: shape=%s dtype=%s size_bytes=%d ptr=0x%x",
+                i,
+                list(buf.shape),
+                buf.dtype,
+                buf_bytes,
+                buf.data_ptr(),
+            )
             super().register_buffer(buf)
+            logger.info("[Mooncake]   buffer[%d] registered OK", i)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
