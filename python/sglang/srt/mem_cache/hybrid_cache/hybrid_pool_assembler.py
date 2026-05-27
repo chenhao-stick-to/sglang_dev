@@ -246,11 +246,24 @@ def _deepseek_v4_num_host_pages(
     page_size: int,
     swa_page_size: int,
 ) -> tuple[int, int]:
+    """Return (full_kv_host_pages, swa_state_host_pages) for DeepSeek V4 HiCache.
+
+    FULL/C4/C128 paged host pools use *full_kv_host_pages* (device FULL pages * ratio).
+
+    SWA/state host pools are sized from the same FULL-prefix token span so L2 backup
+    and L3 seven-pool sync can cover every KV page. Device SWA remains smaller
+    (swa_full_tokens_ratio); only host over-provisions SWA/state slots:
+
+        swa_state_host_pages = (full_kv_host_pages * page_size) // swa_page_size
+    """
+    if page_size <= 0 or swa_page_size <= 0:
+        raise ValueError(
+            f"Invalid page_size={page_size} or swa_page_size={swa_page_size} for HiCache"
+        )
+
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
     device_full_pages = (device_full_size + page_size - 1) // page_size
-
-    device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
     if server_args.hicache_size > 0:
         raise ValueError(
@@ -259,7 +272,7 @@ def _deepseek_v4_num_host_pages(
         )
     ratio = server_args.hicache_ratio
     full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
-    swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
+    swa_host_pages = max((full_host_pages * page_size) // swa_page_size, 1)
     return full_host_pages, swa_host_pages
 
 
@@ -316,6 +329,15 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+    )
+    logger.info(
+        "DeepSeek V4 HiCache host pages: full_kv_pages=%s swa_state_pages=%s "
+        "(page_size=%s swa_page_size=%s hicache_ratio=%s)",
+        num_host_pages,
+        swa_num_host_pages,
+        page_size,
+        kvcache.swa_page_size,
+        server_args.hicache_ratio,
     )
 
     logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)

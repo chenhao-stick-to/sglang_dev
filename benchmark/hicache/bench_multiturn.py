@@ -749,7 +749,7 @@ if __name__ == "__main__":
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
+        # requests.post(flush_cache_url)
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
