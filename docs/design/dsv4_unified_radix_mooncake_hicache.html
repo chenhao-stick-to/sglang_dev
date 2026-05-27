@@ -1,0 +1,1102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSeek V4 · UnifiedRadixCache + Mooncake HiCache 设计文档</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --surface2: #243044;
+      --border: #2d3a4f;
+      --text: #e6edf3;
+      --muted: #8b9cb3;
+      --accent: #58a6ff;
+      --accent2: #3fb950;
+      --warn: #d29922;
+      --l2: #a371f7;
+      --l3: #f778ba;
+      --full: #79c0ff;
+      --swa: #ffa657;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+    header {
+      background: linear-gradient(135deg, #1a2332 0%, #0d1117 50%, #1a1f2e 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 2.5rem 2rem 2rem;
+    }
+    header h1 {
+      margin: 0 0 0.5rem;
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    header p { margin: 0; color: var(--muted); max-width: 72ch; }
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(15, 20, 25, 0.92);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      padding: 0.75rem 2rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1rem;
+    }
+    nav a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+    }
+    nav a:hover { text-decoration: underline; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+    section {
+      margin-bottom: 3rem;
+      scroll-margin-top: 4rem;
+    }
+    h2 {
+      font-size: 1.35rem;
+      border-left: 4px solid var(--accent);
+      padding-left: 0.75rem;
+      margin: 2rem 0 1rem;
+    }
+    h3 { font-size: 1.05rem; color: var(--accent); margin: 1.5rem 0 0.75rem; }
+    p, li { color: var(--text); }
+    .muted { color: var(--muted); font-size: 0.9rem; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin: 1rem 0;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-right: 0.35rem;
+    }
+    .badge-l2 { background: rgba(163, 113, 247, 0.25); color: var(--l2); }
+    .badge-l3 { background: rgba(247, 120, 186, 0.25); color: var(--l3); }
+    .badge-full { background: rgba(121, 192, 255, 0.2); color: var(--full); }
+    .badge-swa { background: rgba(255, 166, 87, 0.2); color: var(--swa); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+      margin: 1rem 0;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 0.6rem 0.75rem;
+      text-align: left;
+    }
+    th { background: var(--surface2); color: var(--accent); }
+    code {
+      background: var(--surface2);
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+    pre {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      overflow-x: auto;
+      font-size: 0.8rem;
+    }
+    .mermaid {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      margin: 1rem 0;
+      overflow-x: auto;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin: 0.75rem 0;
+      font-size: 0.85rem;
+    }
+    .legend span { display: flex; align-items: center; gap: 0.35rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    /* ===== Core principles UI ===== */
+    .principles-hero {
+      margin: 0 0 2.5rem;
+      padding: 0;
+    }
+    .principles-hero > .hero-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+      font-weight: 700;
+    }
+    .principles-hero > h2 {
+      border: none;
+      padding: 0;
+      margin: 0 0 0.35rem;
+      font-size: 1.75rem;
+      background: linear-gradient(90deg, #e6edf3, #58a6ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .principles-hero > .hero-sub {
+      color: var(--muted);
+      max-width: 65ch;
+      margin-bottom: 1.75rem;
+    }
+    .principle-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.25rem;
+    }
+    .principle-card {
+      position: relative;
+      background: linear-gradient(145deg, var(--surface) 0%, #151b24 100%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.35rem 1.35rem 1.35rem 4.25rem;
+      overflow: hidden;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .principle-card:hover {
+      border-color: rgba(88, 166, 255, 0.45);
+      transform: translateY(-2px);
+    }
+    .principle-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 4px;
+      height: 100%;
+    }
+    .principle-card.p-memory::before { background: linear-gradient(180deg, var(--full), var(--accent2)); }
+    .principle-card.p-node::before { background: linear-gradient(180deg, var(--l2), var(--accent)); }
+    .principle-card.p-l3::before { background: linear-gradient(180deg, var(--l3), #ff6b9d); }
+    .principle-num {
+      position: absolute;
+      left: 1rem;
+      top: 1.25rem;
+      width: 2.25rem;
+      height: 2.25rem;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 1rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+    }
+    .principle-card h3 {
+      margin: 0 0 0.5rem;
+      font-size: 1.05rem;
+      color: var(--text);
+    }
+    .principle-card .rule {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--accent2);
+      margin-bottom: 0.65rem;
+      line-height: 1.45;
+    }
+    .principle-card .detail {
+      font-size: 0.875rem;
+      color: var(--muted);
+      margin: 0;
+    }
+    .principle-card .ref {
+      margin-top: 0.75rem;
+      font-size: 0.78rem;
+      color: var(--accent);
+      opacity: 0.9;
+    }
+
+    .compare-split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 700px) {
+      .compare-split { grid-template-columns: 1fr; }
+    }
+    .compare-pane {
+      padding: 1.25rem 1.5rem;
+    }
+    .compare-pane.device {
+      background: rgba(121, 192, 255, 0.06);
+      border-right: 1px solid var(--border);
+    }
+    .compare-pane.host {
+      background: rgba(163, 113, 247, 0.08);
+    }
+    @media (max-width: 700px) {
+      .compare-pane.device { border-right: none; border-bottom: 1px solid var(--border); }
+    }
+    .compare-pane h4 {
+      margin: 0 0 0.75rem;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .compare-pane.device h4 { color: var(--full); }
+    .compare-pane.host h4 { color: var(--l2); }
+    .metric-bar {
+      height: 8px;
+      border-radius: 4px;
+      background: var(--surface2);
+      margin: 0.5rem 0 0.25rem;
+      overflow: hidden;
+    }
+    .metric-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+    .metric-fill.device-swa { width: 50%; background: linear-gradient(90deg, #388bfd, #79c0ff); }
+    .metric-fill.host-full { width: 100%; background: linear-gradient(90deg, #8957e5, #a371f7); }
+    .metric-label { font-size: 0.8rem; color: var(--muted); }
+
+    .invariant-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem 1rem;
+      padding: 1.25rem 1.5rem;
+      background: rgba(63, 185, 80, 0.08);
+      border: 1px dashed rgba(63, 185, 80, 0.45);
+      border-radius: 12px;
+      margin: 1.25rem 0;
+      font-size: 0.95rem;
+    }
+    .invariant-strip .pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.85rem;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .invariant-strip .arrow { color: var(--accent2); font-weight: bold; }
+    .invariant-strip .fail { color: #f85149; text-decoration: line-through; opacity: 0.7; }
+
+    .l3-contract {
+      background: linear-gradient(180deg, rgba(247, 120, 186, 0.06) 0%, var(--surface) 40%);
+      border: 1px solid rgba(247, 120, 186, 0.35);
+      border-radius: 14px;
+      padding: 1.5rem;
+      margin: 1.5rem 0;
+    }
+    .l3-contract h3 {
+      color: var(--l3);
+      margin-top: 0;
+    }
+    .l3-steps {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin-top: 1.25rem;
+    }
+    @media (max-width: 800px) {
+      .l3-steps { grid-template-columns: 1fr; }
+    }
+    .l3-step {
+      background: var(--surface2);
+      border-radius: 10px;
+      padding: 1rem;
+      border: 1px solid var(--border);
+      text-align: center;
+    }
+    .l3-step .step-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--l3);
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+    .l3-step .step-title { font-weight: 700; margin-bottom: 0.35rem; }
+    .l3-step .step-desc { font-size: 0.8rem; color: var(--muted); margin: 0; }
+
+    .fast-fail-banner {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem 1.25rem;
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid rgba(248, 81, 73, 0.4);
+      border-radius: 10px;
+      margin-top: 1rem;
+    }
+    .fast-fail-banner .icon {
+      font-size: 1.75rem;
+      line-height: 1;
+    }
+    .fast-fail-banner p { margin: 0; font-size: 0.9rem; }
+
+    .pool-sync-viz {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      justify-content: center;
+      margin: 1rem 0;
+    }
+    .pool-chip {
+      padding: 0.35rem 0.65rem;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      border: 1px solid;
+    }
+    .pool-chip.prefix { border-color: var(--full); color: var(--full); background: rgba(121,192,255,0.1); }
+    .pool-chip.window { border-color: var(--swa); color: var(--swa); background: rgba(255,166,87,0.1); }
+    .pool-chip.sync { box-shadow: 0 0 0 2px var(--accent2); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DeepSeek V4 · UnifiedRadixCache + Mooncake HiCache</h1>
+    <p>
+      本文档总结 DSV4 在 SGLang 中的分层 KV 缓存设计：UnifiedRadixTree 节点与 7 个 sidecar host pool 的交互，
+      L2（write_backup / load_back）与 L3（write_backup_storage / prefetch_from_storage）路径，
+      以及 Mooncake 如何将 page hash 转化为物理 storage key。
+    </p>
+  </header>
+
+  <nav>
+    <a href="#principles"><strong>★ 核心设计</strong></a>
+    <a href="#arch">架构总览</a>
+    <a href="#node">Tree Node</a>
+    <a href="#pools">七池 + Anchor</a>
+    <a href="#match">Match / BestNode</a>
+    <a href="#l2-backup">L2 write_backup</a>
+    <a href="#l2-load">L2 load_back</a>
+    <a href="#l3-backup">L3 write_backup_storage</a>
+    <a href="#l3-prefetch">L3 prefetch</a>
+    <a href="#storage-key">Storage Key</a>
+    <a href="#scheduler">Scheduler</a>
+    <a href="#files">源码索引</a>
+  </nav>
+
+  <main>
+    <!-- ========== CORE PRINCIPLES ========== -->
+    <section id="principles" class="principles-hero">
+      <p class="hero-title">Design Contract · 设计契约</p>
+      <h2>核心设计原则</h2>
+      <p class="hero-sub">
+        以下五条是 DSV4 HiCache + Mooncake 的<strong>不可违背契约</strong>：内存容量、节点备份原子性、以及 L3 七池前缀一致性（exists / get / set 同源逻辑）。
+      </p>
+
+      <div class="principle-grid">
+        <article class="principle-card p-memory">
+          <span class="principle-num">①</span>
+          <h3>Device SWA 比例不变 · Host 拥有全量页</h3>
+          <p class="rule">GPU 仍按 <code>swa_full_tokens_ratio</code> 缩小 SWA；Host 按 FULL 前缀 token 跨度过配 SWA/STATE 槽位。</p>
+          <p class="detail">
+            <code>full_host_pages = device_full_pages × hicache_ratio</code><br/>
+            <code>swa_host_pages = (full_host_pages × page_size) ÷ swa_page_size</code><br/>
+            保证 L2/L3 可覆盖与 FULL 等长的前缀页，而<strong>不改变 device 侧 ratio 策略</strong>。
+          </p>
+          <p class="ref">→ hybrid_pool_assembler._deepseek_v4_num_host_pages</p>
+        </article>
+
+        <article class="principle-card p-node">
+          <span class="principle-num">②</span>
+          <h3>仅「FULL + SWA 同长同节点」才允许备份</h3>
+          <p class="rule">write_backup / write_backup_storage 前：FULL.value 与 SWA.value 必须同时存在且 token 数相等。</p>
+          <p class="detail">
+            SWA tombstone（仅 FULL、无 SWA device）→ <code>write_backup_skip_incomplete_swa</code>，不进 L2/L3。
+            七池 L3 还要求 registered 七池全部出现在 transfer 中，否则 <code>skip_partial_dsv4</code>。
+          </p>
+          <p class="ref">→ unified_radix_cache.write_backup · write_backup_storage</p>
+        </article>
+
+        <article class="principle-card p-node">
+          <span class="principle-num">③</span>
+          <h3>每个可备份 Node 拥有完整 FULL + SWA（+ 七池 sidecar）</h3>
+          <p class="rule">节点级原子性：一次 backup 把该节点上 FULL、SWA、C4/C128/STATE 对齐到同一 logical 页槽。</p>
+          <p class="detail">
+            C4/C128 跟 KV anchor indices；STATE 跟 SWA indices。单节点内各池 host 页一一对应，避免「FULL 已 backup、SWA 缺页」的 L3 不一致。
+          </p>
+          <p class="ref">→ SidecarPoolSpec.indices_from_pool · commit_hicache_transfer</p>
+        </article>
+
+        <article class="principle-card p-l3">
+          <span class="principle-num">④</span>
+          <h3>L3 exists：七池取「最小可共用前缀」</h3>
+          <p class="rule">batch_exists_v2 对 required 池（C4/C128/C4_INDEXER）与 SWA 窗口池分别算边界，<code>final_pages = min(各池命中页)</code>。</p>
+          <p class="detail">
+            全前缀池必须 page 0…N 连续存在；SWA/state 在 <code>[0, final_tokens)</code> 窗口内每页独立 hash 也需齐全。输出 <code>pool_token_ranges</code> 供后续 get/set 裁剪。
+          </p>
+          <p class="ref">→ mooncake_store.batch_exists_v2 · hybrid_cache_controller._storage_hit_query</p>
+        </article>
+
+        <article class="principle-card p-l3">
+          <span class="principle-num">⑤</span>
+          <h3>L3 get / set：七池按 KV 页同步 · 快速失败</h3>
+          <p class="rule">_io_dsv4_pools_grouped：同一 <code>kv_page_idx</code> 上七池一起 get/set；任一池该页失败 → 立即停止后续页。</p>
+          <p class="detail">
+            Get：每页所有池的 component key 都 get 成功才算该 KV 页 OK。Set：exist 后缺 key 才 put，任一页任池失败则截断前缀。保证 Mooncake 与 radix 树「七池同前缀」契约。
+          </p>
+          <p class="ref">→ mooncake_store._io_dsv4_pools_grouped · _batch_io_v2_dsv4_grouped</p>
+        </article>
+      </div>
+
+      <!-- Device vs Host capacity -->
+      <h3 style="margin-top:2rem;border:none;padding:0;color:var(--text)">内存容量：Device 小 SWA · Host 全前缀页</h3>
+      <div class="compare-split">
+        <div class="compare-pane device">
+          <h4>L1 Device（策略不变）</h4>
+          <p class="metric-label">FULL KV pages — 100% 基准</p>
+          <div class="metric-bar"><div class="metric-fill" style="width:100%;background:linear-gradient(90deg,#388bfd,#79c0ff)"></div></div>
+          <p class="metric-label">SWA pages — ≈ swa_full_tokens_ratio（如 50%）</p>
+          <div class="metric-bar"><div class="metric-fill device-swa"></div></div>
+          <p class="muted" style="margin:0.75rem 0 0;font-size:0.82rem">Device 仍可能 SWA tombstone；radix 允许 FULL on GPU + SWA 仅 host。</p>
+        </div>
+        <div class="compare-pane host">
+          <h4>L2 Host（过配以对齐 FULL 前缀）</h4>
+          <p class="metric-label">FULL logical + C4/C128 host pages — full_host_pages</p>
+          <div class="metric-bar"><div class="metric-fill host-full"></div></div>
+          <p class="metric-label">SWA + STATE host pages — swa_host_pages（与 FULL token 跨度对齐）</p>
+          <div class="metric-bar"><div class="metric-fill host-full"></div></div>
+          <p class="muted" style="margin:0.75rem 0 0;font-size:0.82rem">Host 可缓存比 GPU 同时容纳更长的 SWA 前缀（HiCache 分层预期行为）。</p>
+        </div>
+      </div>
+
+      <!-- Node backup invariant -->
+      <h3 style="border:none;padding:0;color:var(--text)">节点备份门控（L2 / L3 共用）</h3>
+      <div class="invariant-strip">
+        <span class="pill">FULL.value ✓</span>
+        <span class="arrow">+</span>
+        <span class="pill">SWA.value ✓</span>
+        <span class="arrow">+</span>
+        <span class="pill">len(SWA) == len(FULL)</span>
+        <span class="arrow">→</span>
+        <span class="pill" style="border-color:var(--accent2);color:var(--accent2)">允许 write_backup</span>
+      </div>
+      <div class="invariant-strip" style="background:rgba(248,81,73,0.06);border-color:rgba(248,81,73,0.35)">
+        <span class="pill fail">SWA tombstone</span>
+        <span class="arrow">或</span>
+        <span class="pill fail">缺 C4/STATE 池</span>
+        <span class="arrow">→</span>
+        <span class="pill" style="border-color:#f85149;color:#f85149">跳过 L2/L3 backup</span>
+      </div>
+
+      <div class="mermaid">
+flowchart LR
+  subgraph OK["✓ 可备份节点"]
+    N1["Node N"]
+    N1 --> F1["FULL value + host_value"]
+    N1 --> S1["SWA value 等长"]
+    N1 --> P1["七池 DMA 同 indices"]
+  end
+  subgraph BAD["✗ 不可备份"]
+    N2["Node M"]
+    N2 --> F2["FULL ✓"]
+    N2 --> S2["SWA tombstone ✗"]
+  end
+      </div>
+
+      <!-- L3 contract -->
+      <div class="l3-contract">
+        <h3>L3 七池一致性契约（Mooncake）</h3>
+        <p class="muted" style="margin-top:0">exists 定边界 → get/set 在<strong>同一批 KV 页</strong>上对 7 个池<strong>同步</strong>成功或<strong>快速截断</strong>。</p>
+
+        <div class="pool-sync-viz">
+          <span class="pool-chip prefix sync">C4</span>
+          <span class="pool-chip prefix sync">C4_INDEXER</span>
+          <span class="pool-chip prefix sync">C128</span>
+          <span class="pool-chip window sync">SWA</span>
+          <span class="pool-chip window sync">C4_STATE</span>
+          <span class="pool-chip window sync">C4_INDEXER_STATE</span>
+          <span class="pool-chip window sync">C128_STATE</span>
+        </div>
+        <p class="muted" style="text-align:center;font-size:0.8rem">绿色描边 = 同一 kv_page_idx 必须同时 OK</p>
+
+        <div class="l3-steps">
+          <div class="l3-step">
+            <div class="step-label">Phase A</div>
+            <div class="step-title">batch_exists_v2</div>
+            <p class="step-desc">required 池 chained 前缀连续命中；window 池窗口内每页命中；<strong>final_pages = min(全部)</strong></p>
+          </div>
+          <div class="l3-step">
+            <div class="step-label">Phase B · Get</div>
+            <div class="step-title">prefetch grouped get</div>
+            <p class="step-desc">对每个 kv_page_idx：七池 key+ptr 批量 get；<strong>任一池失败 → break</strong>，不拉后续页</p>
+          </div>
+          <div class="l3-step">
+            <div class="step-label">Phase C · Set</div>
+            <div class="step-title">backup grouped set</div>
+            <p class="step-desc">对每个 kv_page_idx：七池 batch exist+put；<strong>任一池失败 → break</strong>，已写页不回滚但前缀截断</p>
+          </div>
+        </div>
+
+        <div class="fast-fail-banner">
+          <span class="icon">⚡</span>
+          <div>
+            <strong>快速失败（Fast-Fail）</strong>
+            <p><code>_io_dsv4_pools_grouped</code> 在 <code>if not all(page_ok_by_plan.values()): break</code> 处停止递增 kv_page_idx，避免「KV 页 k 上 C4 成功但 SWA 失败」的半套前缀进入 radix。</p>
+          </div>
+        </div>
+
+        <div class="mermaid">
+flowchart TB
+  subgraph Exists["exists 阶段"]
+    E0[KV 候选页 hash 列表] --> E1[C4 / C128 / C4_INDEXER 边界]
+    E0 --> E2[SWA + 3×STATE 窗口边界]
+    E1 --> EM["final_pages = min 全部"]
+    E2 --> EM
+    EM --> TR["pool_token_ranges = 0..final_tokens"]
+  end
+
+  subgraph IO["get / set 阶段 per kv_page_idx"]
+    P0[page 0: 7 pools] --> P0ok{全 OK?}
+    P0ok -->|是| P1[page 1: 7 pools]
+    P0ok -->|否| STOP[break 截断]
+    P1 --> P1ok{全 OK?}
+    P1ok -->|否| STOP
+  end
+
+  Exists --> IO
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 1. Architecture ========== -->
+    <section id="arch">
+      <h2>1. 架构总览</h2>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--full)"></span> Device GPU</span>
+        <span><span class="dot" style="background:var(--l2)"></span> L2 Host (HiCache)</span>
+        <span><span class="dot" style="background:var(--l3)"></span> L3 Mooncake</span>
+        <span><span class="dot" style="background:var(--swa)"></span> SWA / State 窗口池</span>
+      </div>
+
+      <div class="mermaid">
+flowchart TB
+  subgraph Scheduler["Scheduler / PrefillAdder"]
+    MP[match_prefix]
+    ILB[init_load_back]
+    PFS[prefetch_from_storage]
+  end
+
+  subgraph URC["UnifiedRadixCache"]
+    TN[UnifiedTreeNode<br/>FULL + SWA ComponentData]
+    WB[write_backup]
+    WBS[write_backup_storage]
+    LB[load_back]
+  end
+
+  subgraph HCC["HybridCacheController"]
+    W[write D→H]
+    L[load H→D]
+    WS[write_storage]
+    PF[prefetch]
+  end
+
+  subgraph HostPools["HostPoolGroup (DSV4)"]
+    KV[LogicalHostPool KV anchor]
+    C4[C4 / C4_INDEXER / C128]
+    SWA[SWA]
+    ST[C4_STATE / INDEXER_STATE / C128_STATE]
+  end
+
+  subgraph Mooncake["MooncakeStore"]
+    BE[batch_exists_v2]
+    BS[batch_set_v2]
+    BG[batch_get_v2 grouped]
+    SK[Storage Key 生成]
+  end
+
+  MP --> TN
+  ILB --> LB
+  PFS --> PF
+  WB --> W
+  LB --> L
+  WBS --> WS
+  PF --> BE
+  WS --> BS
+  PF --> BG
+  W --> HostPools
+  L --> HostPools
+  BS --> SK
+  BG --> SK
+  BE --> SK
+      </div>
+
+      <div class="card">
+        <strong>三层语义</strong>
+        <ul>
+          <li><span class="badge badge-full">L1 Device</span> FULL / SWA / C4 等 GPU pool；radix 节点 <code>component_data[ct].value</code></li>
+          <li><span class="badge badge-l2">L2 Host</span> HiCache host pool；<code>host_value</code>；<code>backuped</code> = FULL 有 host_value</li>
+          <li><span class="badge badge-l3">L3 Storage</span> Mooncake；按 page hash + pool suffix 零拷贝读写 host buffer</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ========== 2. Tree Node ========== -->
+    <section id="node">
+      <h2>2. UnifiedTreeNode 与组件数据</h2>
+
+      <div class="mermaid">
+classDiagram
+  class UnifiedTreeNode {
+    +RadixKey key
+    +List~ComponentData~ component_data
+    +List~str~ hash_value
+    +bool evicted
+    +bool backuped
+    +int hit_count
+  }
+  class ComponentData {
+    +Tensor value
+    +Tensor host_value
+    +int lock_ref
+    +int host_lock_ref
+  }
+  UnifiedTreeNode --> ComponentData : FULL
+  UnifiedTreeNode --> ComponentData : SWA
+
+  note for UnifiedTreeNode "evicted = FULL.value is None\nbackuped = FULL.host_value is not None"
+  note for ComponentData "SWA tombstone: value=None, host_value 可有"
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>属性</th><th>含义</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>evicted</code></td><td>FULL 无 device value</td><td>load_back 向上收集 host FULL 链的停止条件（接上 device FULL 祖先）</td></tr>
+          <tr><td><code>backuped</code></td><td>FULL 有 host_value</td><td>match 边界、H-leaf、L3 backup 前置</td></tr>
+          <tr><td><code>hash_value</code></td><td>按 page_size 链式 SHA256</td><td>L3 storage key 的逻辑页 hash（C4 等 chained 池复用 token 重算）</td></tr>
+          <tr><td>SWA tombstone</td><td><code>SWA.value=None</code>, FULL 仍可用</td><td>match 允许 host SWA；load_back 只补 host-only SWA 段</td></tr>
+        </tbody>
+      </table>
+
+      <h3>节点分裂（page 对齐）</h3>
+      <p class="muted"><code>_split_node</code> 使用 <code>RadixKey.match(..., page_size)</code>，split_len 必为 page_size 整数倍。DSV4 paged HiCache 下 <code>page_size == swa_page_size</code>（通常 256）。</p>
+    </section>
+
+    <!-- ========== 3. Pools ========== -->
+    <section id="pools">
+      <h2>3. DSV4 七 Sidecar Pool + KV Anchor</h2>
+      <p class="muted">容量策略见 <a href="#principles">核心设计 §①</a>。</p>
+      <p>构建入口：<code>hybrid_pool_assembler.build_deepseek_v4_hicache_stack</code></p>
+
+      <div class="mermaid">
+flowchart LR
+  subgraph PrefixPools["全前缀池 chained"]
+    C4[DEEPSEEK_V4_C4]
+    CI[DEEPSEEK_V4_C4_INDEXER]
+    C128[DEEPSEEK_V4_C128]
+  end
+
+  subgraph WindowPools["SWA 窗口池 non-chained"]
+    SWA[SWA]
+    S1[C4_STATE]
+    S2[C4_INDEXER_STATE]
+    S3[C128_STATE]
+  end
+
+  KV[LogicalHostPool<br/>PoolName.KV anchor]
+
+  KV -->|"indices_from_pool=KV"| C4
+  KV --> CI
+  KV --> C128
+  SWA -->|"indices_from_pool=SWA"| S1
+  SWA --> S2
+  SWA --> S3
+      </div>
+
+      <h3>Host 页容量 sizing</h3>
+      <pre>full_host_pages  = device_full_pages * hicache_ratio
+swa_host_pages   = (full_host_pages * page_size) // swa_page_size   # 与 FULL 前缀 token 跨度对齐
+device SWA 仍按 swa_full_tokens_ratio 缩小；仅 host SWA/state 过配</pre>
+
+      <table>
+        <thead>
+          <tr><th>Pool</th><th>Host 类</th><th>Sidecar 索引来源</th><th>L2 DMA</th><th>L3 hash 类型</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>KV (anchor)</td><td>LogicalHostPool</td><td>—</td><td>无字节，仅 logical slot</td><td>—（v2 无 KV payload）</td></tr>
+          <tr><td>C4 / C4_INDEXER / C128</td><td>DeepSeekV4PagedHostPool</td><td>KV</td><td>跟 FULL host_indices</td><td><strong>chained</strong>（接 parent last_hash）</td></tr>
+          <tr><td>SWA</td><td>DeepSeekV4PagedHostPool</td><td>SWA component</td><td>SWA 窗口内 host-only 节点</td><td><strong>non-chained</strong></td></tr>
+          <tr><td>*_STATE (×3)</td><td>DeepSeekV4StateHostPool</td><td>SWA</td><td>复用 SWA indices，无独立 alloc</td><td><strong>non-chained</strong>（同 SWA）</td></tr>
+        </tbody>
+      </table>
+
+      <div class="card">
+        <strong>Sidecar 注册</strong>（<code>hybrid_pool_assembler.maybe_register_hicache</code>）：
+        <code>register_sidecar_pool(SidecarPoolSpec(pool_name, indices_from_pool))</code>
+        — L2/L3 的 DMA 与 storage transfer 均通过 <code>indices_from_pool</code> 派生 indices/keys。
+      </div>
+    </section>
+
+    <!-- ========== 4. Match ========== -->
+    <section id="match">
+      <h2>4. match_prefix 与 best_match_node</h2>
+
+      <div class="mermaid">
+sequenceDiagram
+  participant S as Scheduler
+  participant URC as UnifiedRadixCache
+  participant FULL as FullComponent
+  participant SWA as SWAComponent
+
+  S->>URC: match_prefix(key)
+  URC->>URC: 沿 radix 走前缀
+  Note over URC: child.evicted && !backuped → 停止
+
+  URC->>FULL: validator: value OR backuped
+  URC->>SWA: validator: value OR host_value<br/>窗口 ≥ sliding_window_size
+
+  URC-->>S: best_match_node (所有 validator 通过的最深节点)
+  URC-->>S: last_device_node (FULL device 最深)
+  URC-->>S: host_hit_length (FULL host 段 + SWA host-only 触发)
+
+  alt host_hit_length > 0
+    S->>URC: init_load_back(best_match_node)
+    URC->>URC: load_back → L2 H→D
+  end
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <span class="badge badge-full">best_match_node</span>
+          匹配边界起点；<strong>不是</strong>「只处理这一个节点」——load_back 会向上扫链/窗口。
+        </div>
+        <div class="card">
+          <span class="badge badge-swa">SWA tombstone + FULL on device</span>
+          best_match 可停在 tombstone；<code>host_hit_length≥1</code> 仍触发 load_back，主要补 SWA/state。
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 5. L2 write_backup ========== -->
+    <section id="l2-backup">
+      <h2>5. L2 write_backup（Device → Host）</h2>
+      <p>触发：<code>_inc_hit_count</code> 达阈值，或 device leaf demote（write_back 策略）。</p>
+
+      <div class="mermaid">
+flowchart TD
+  A[write_backup node] --> B{parent backuped?}
+  B -->|否| X[skip write_backup_skip_parent]
+  B -->|是| C{FULL.value 存在?}
+  C -->|否| X2[skip incomplete_full]
+  C -->|是| D{SWA len == FULL len?}
+  D -->|否| X3[skip incomplete_swa tombstone]
+  D -->|是| E[build PoolTransfer]
+
+  E --> F[KV: device_indices = FULL.value]
+  E --> G[SWA: device_indices = SWA.value]
+  E --> H[sidecar: indices_from_pool KV/SWA]
+
+  F --> I[HybridCacheController.write]
+  G --> I
+  H --> I
+
+  I --> J[alloc KV host + SWA host + resolve sidecar]
+  I --> K[async DMA backup_from_device_all_layer]
+  K --> L[commit: 写 node.host_value]
+  L --> M[writing_check → 可选 write_backup_storage]
+      </div>
+
+      <h3>各组件 backup 范围（单节点 atomic）</h3>
+      <ul>
+        <li><strong>FULL + C4/C128/C4_INDEXER</strong>：仅当前节点（单 leaf backup），indices 等长</li>
+        <li><strong>SWA + STATE</strong>：同节点 SWA indices；STATE 跟 SWA，不单独扫树</li>
+        <li><strong>前置条件</strong>：FULL 与 SWA 必须同 token 数，避免 SWA tombstone 节点进 L3</li>
+      </ul>
+    </section>
+
+    <!-- ========== 6. L2 load_back ========== -->
+    <section id="l2-load">
+      <h2>6. L2 load_back（Host → Device）</h2>
+      <p>入口：<code>init_load_back</code> → <code>load_back(best_match_node)</code></p>
+
+      <div class="mermaid">
+flowchart TB
+  BM[best_match_node] --> FULL_L[FullComponent LOAD_BACK]
+  BM --> SWA_L[SWAComponent LOAD_BACK]
+
+  FULL_L --> F1["while cur.evicted:<br/>收集 cur.host_value<br/>cur = parent"]
+  F1 --> F2["停止: 祖先 FULL 已在 device"]
+
+  SWA_L --> S1["while n_swa &lt; window:<br/>若 SWA.value 有 → 跳过<br/>若仅 host_value → 收集"]
+  S1 --> S2["cur = parent"]
+
+  F1 --> MERGE[HybridCacheController.load]
+  S1 --> MERGE
+  MERGE --> DMA[start_loading 各 pool H→D]
+  DMA --> COMMIT[commit 写回 nodes_to_load 的 value]
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>池类型</th><th>向上扫描规则</th><th>是否只 load bestnode</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FULL + C4/C128/C4_INDEXER</td><td>沿 <code>evicted</code> 链到 non-evicted 祖先</td><td>否，可多节点</td></tr>
+          <tr><td>SWA + STATE</td><td>窗口内 host-only SWA 节点</td><td>否，可 0/1/N 个节点</td></tr>
+        </tbody>
+      </table>
+
+      <p class="muted">阈值：<code>load_back_threshold=256</code>；若 FULL 段太短但 SWA aux 有数据，仍可能 load（<code>kv_tokens=0</code> 路径）。</p>
+    </section>
+
+    <!-- ========== 7. L3 write_backup_storage ========== -->
+    <section id="l3-backup">
+      <h2>7. L3 write_backup_storage（Host → Mooncake）</h2>
+      <p class="muted">设计契约见 <a href="#principles">核心设计 §⑤</a>：七池 grouped set + 快速失败。</p>
+      <p>在 L2 <code>writing_check</code> 完成后，若 <code>enable_storage</code> 为真。</p>
+
+      <div class="mermaid">
+sequenceDiagram
+  participant URC as UnifiedRadixCache
+  participant HCC as HybridCacheController
+  participant MC as MooncakeStore
+
+  URC->>URC: write_backup_storage(node)
+  Note over URC: node.hash_value 链式页 hash<br/>host_value = FULL.host_value
+  URC->>URC: _collect_storage_backup_pool_transfers<br/>SWA + 7 sidecar keys/host_indices
+
+  alt 7池未全在 transfer
+    URC->>URC: skip write_backup_storage_skip_partial_dsv4
+  else OK
+    URC->>HCC: write_storage(host_value, token_ids, hash_value, extra_pools)
+    HCC->>HCC: _resolve_sidecar_derived_pool_transfers
+    Note over HCC: C4→KV indices/keys<br/>STATE→SWA indices/keys
+    HCC->>MC: batch_set_v2 → _batch_io_v2_dsv4_grouped
+    MC->>MC: 按 kv_page_idx 七池同步 put
+  end
+      </div>
+
+      <div class="card">
+        <strong>七池 L3 原子性</strong>：<code>_io_dsv4_pools_grouped</code> 按 KV 页下标同步；
+        任一池该页失败则截断公共前缀（与 <code>batch_exists_v2</code> 的 <code>full_prefix_pages = min(...)</code> 一致）。
+      </div>
+    </section>
+
+    <!-- ========== 8. L3 prefetch ========== -->
+    <section id="l3-prefetch">
+      <h2>8. L3 prefetch_from_storage（Mooncake → Host）</h2>
+      <p class="muted">设计契约见 <a href="#principles">核心设计 §④⑤</a>：exists 最小共用前缀 → grouped get。</p>
+
+      <div class="mermaid">
+flowchart TD
+  A[prefetch_from_storage] --> B{prefetch_length ≥ threshold?}
+  B -->|否| SKIP[prefetch_skip]
+  B -->|是| C[alloc logical KV host_indices]
+  C --> D[_collect_storage_prefetch_pool_transfers]
+  D --> E[HybridCacheController.prefetch]
+
+  E --> F[_storage_hit_query]
+  F --> G[batch_exists_v2 七池 exists]
+  G --> H[pool_token_ranges = 0, final_tokens]
+
+  H --> I[_prepare_storage_prefetch_pool_transfers]
+  I --> J[SWA alloc host; STATE 跟 SWA indices]
+  I --> K[C4 跟 KV anchor indices]
+
+  K --> L[batch_get_v2 grouped get]
+  L --> M[insert_helper_host 挂到 radix 树]
+  M --> N[scheduler pop_prefetch_loaded_tokens → storage_hit_length]
+      </div>
+
+      <p class="muted">Prefetch 锚点：<code>last_host_node</code>（向上第一个 backuped），不是 best_match_node。</p>
+    </section>
+
+    <!-- ========== 9. Storage Key ========== -->
+    <section id="storage-key">
+      <h2>9. Mooncake Storage Key 生成</h2>
+
+      <div class="mermaid">
+flowchart LR
+  subgraph Input
+    T[token_ids]
+    LH[last_hash / parent hash]
+    TH[transfer.keys = node.hash_value]
+  end
+
+  subgraph DSV4Hash["_dsv4_storage_page_keys"]
+    CH{池类型?}
+    CH -->|C4/C128/C4_INDEXER| P1["chained:<br/>get_hash_str(page, prior_hash)"]
+    CH -->|SWA/STATE| P2["non-chained:<br/>get_hash_str(page, None)"]
+  end
+
+  subgraph Physical["_get_hybrid_page_component_keys"]
+    SK["page_key + suffix"]
+    SK --> EX["例: {hash}_{rank}_deepseek_v4_c4_L0"]
+  end
+
+  subgraph MooncakeIO
+    TAG["_tag_keys optional backend_tag"]
+    ZC[zero-copy get/put]
+  end
+
+  T --> DSV4Hash
+  LH --> P1
+  TH --> DSV4Hash
+  DSV4Hash --> SK
+  SK --> TAG --> ZC
+      </div>
+
+      <h3>Key 公式</h3>
+      <pre>逻辑页 hash (chained):  SHA256(prior_hash || page_tokens)  逐页链接
+逻辑页 hash (SWA/window): SHA256(page_tokens)                   每页独立
+
+物理 Mooncake key:       {optional_tag}_{page_hash}{suffix}
+suffix 示例:
+  SWA:     _{mha_rank}_swa
+  C4:      _{mla_rank}_deepseek_v4_c4  或 _L{i} (layer_first 多层)
+  STATE:   _{mla_rank}_deepseek_v4_c4_state
+
+一页可能 → key_multiplier 个 object（每层一个 suffix），全部 exist 才算该页命中。</pre>
+
+      <table>
+        <thead>
+          <tr><th>阶段</th><th>函数</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>exists (prefetch 前)</td><td><code>batch_exists_v2</code></td><td>七池前缀边界对齐 → <code>pool_token_ranges</code></td></tr>
+          <tr><td>plan</td><td><code>_build_pool_io_plan</code></td><td>storage_keys 长度 = host_indices // page_size</td></tr>
+          <tr><td>grouped I/O</td><td><code>_io_dsv4_pools_grouped</code></td><td>同一 kv_page_idx 七池 batch get/set</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ========== 10. Scheduler ========== -->
+    <section id="scheduler">
+      <h2>10. Scheduler 与 Cache Token 统计</h2>
+
+      <div class="mermaid">
+sequenceDiagram
+  participant Sch as Scheduler _get_new_batch_prefill_raw
+  participant TC as tree_cache
+  participant PA as PrefillAdder
+  participant Req as Req
+
+  Sch->>TC: check_hicache_events
+  loop waiting_queue
+    Sch->>TC: check_prefetch_progress(rid)
+    Sch->>TC: pop_prefetch_loaded_tokens → storage_hit_length
+    Sch->>Req: init_next_round_input → match_prefix
+    Sch->>PA: add_one_req → init_load_back if host_hit
+  end
+  Sch->>Sch: prepare_for_extend
+  Note over Req: cached_tokens += new_cached<br/>device/host/storage breakdown
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>Req 字段</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>cached_tokens</code></td><td>总 cache token</td></tr>
+          <tr><td><code>host_hit_length</code></td><td>match 时 host 命中长度（含将被 load 的 host 段）</td></tr>
+          <tr><td><code>storage_hit_length</code></td><td>L3 prefetch 加载的 token 数</td></tr>
+          <tr><td><code>cached_tokens_device / _host / _storage</code></td><td>首次 extend 时拆分（storage ⊆ host_total）</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ========== 11. End-to-end ========== -->
+    <section id="e2e">
+      <h2>11. 端到端数据流（单请求）</h2>
+
+      <div class="mermaid">
+stateDiagram-v2
+  [*] --> Match: 新请求
+  Match --> Prefetch: enable_hicache_storage<br/>last_host backuped
+  Prefetch --> L3Hit: Mooncake get 七池
+  L3Hit --> Match2: insert host 段
+  Match2 --> LoadBack: host_hit_length > 0
+  LoadBack --> Extend: L2 H→D
+  Extend --> Forward: prefill compute
+  Forward --> WriteBackup: hit_count ≥ threshold
+  WriteBackup --> L2Done: L2 D→H
+  L2Done --> WriteStorage: enable_storage
+  WriteStorage --> L3Done: Mooncake set 七池
+  L3Done --> [*]
+      </div>
+    </section>
+
+    <!-- ========== 12. Files ========== -->
+    <section id="files">
+      <h2>12. 源码索引</h2>
+      <table>
+        <thead>
+          <tr><th>模块</th><th>路径</th><th>职责</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Host 栈组装</td><td><code>mem_cache/hybrid_cache/hybrid_pool_assembler.py</code></td><td>DSV4 host pages、七池、sidecar 注册</td></tr>
+          <tr><td>Radix + HiCache</td><td><code>mem_cache/unified_radix_cache.py</code></td><td>write_backup / load_back / prefetch / storage</td></tr>
+          <tr><td>FULL / SWA 组件</td><td><code>unified_cache_components/full_component.py</code>, <code>swa_component.py</code></td><td>build_hicache_transfers / commit</td></tr>
+          <tr><td>Hybrid 控制器</td><td><code>hybrid_cache/hybrid_cache_controller.py</code></td><td>write/load/prefetch/storage、sidecar resolve</td></tr>
+          <tr><td>Mooncake</td><td><code>storage/mooncake_store/mooncake_store.py</code></td><td>DSV4 grouped I/O、storage key</td></tr>
+          <tr><td>Scheduler</td><td><code>managers/scheduler.py</code>, <code>schedule_policy.py</code></td><td>prefetch 等待、init_load_back、cached_tokens</td></tr>
+          <tr><td>Debug</td><td><code>unified_radix_hicache_debug.py</code></td><td><code>SGLANG_UNIFIED_RADIX_HICACHE_DEBUG=1</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    DeepSeek V4 UnifiedRadixCache + Mooncake HiCache Design Doc · SGLang inference_framework · Generated for internal reference
+  </footer>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "dark",
+      themeVariables: {
+        primaryColor: "#1a2332",
+        primaryTextColor: "#e6edf3",
+        primaryBorderColor: "#58a6ff",
+        lineColor: "#8b9cb3",
+        secondaryColor: "#243044",
+        tertiaryColor: "#0f1419",
+        fontFamily: "Segoe UI, PingFang SC, sans-serif"
+      },
+      flowchart: { curve: "basis", htmlLabels: true },
+      sequence: { mirrorActors: false }
+    });
+  </script>
+</body>
+</html>

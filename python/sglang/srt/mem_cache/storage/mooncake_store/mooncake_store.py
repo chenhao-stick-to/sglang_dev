@@ -59,6 +59,56 @@ _DSV4_SWA_WINDOW_POOL_NAMES = frozenset(
 
 logger = logging.getLogger(__name__)
 
+_MOONCAKE_EXISTS_SEGMENT_LOG_PREFIX = "[Mooncake][batch_exists]"
+_warned_missing_batch_get_replica_desc = False
+
+
+def _mooncake_endpoint_host(endpoint: str) -> str:
+    """Host part of a Mooncake transport endpoint (hostname:port)."""
+    if not endpoint:
+        return ""
+    endpoint = str(endpoint).strip()
+    if endpoint.startswith("["):
+        closing = endpoint.find("]:")
+        if closing != -1:
+            return endpoint[1:closing]
+        return endpoint.strip("[]")
+    host, sep, maybe_port = endpoint.rpartition(":")
+    if sep and maybe_port.isdigit():
+        return host
+    return endpoint
+
+
+def _mooncake_extract_replica_endpoints(descriptors: Any) -> List[str]:
+    endpoints: List[str] = []
+    for desc in descriptors or []:
+        endpoint = getattr(desc, "transport_endpoint_", None) or getattr(
+            desc, "transport_endpoint", None
+        )
+        if endpoint:
+            endpoints.append(str(endpoint))
+            continue
+        try:
+            if desc.is_memory_replica():
+                mem_desc = desc.get_memory_descriptor()
+                buffer_desc = getattr(mem_desc, "buffer_descriptor", None)
+                if buffer_desc is not None:
+                    endpoint = getattr(
+                        buffer_desc, "transport_endpoint_", None
+                    ) or getattr(buffer_desc, "transport_endpoint", None)
+                    if endpoint:
+                        endpoints.append(str(endpoint))
+                        continue
+            elif desc.is_disk_replica():
+                disk_desc = desc.get_disk_descriptor()
+                path = getattr(disk_desc, "file_path", None)
+                endpoints.append(f"disk:{path}" if path else "disk")
+                continue
+        except Exception:
+            pass
+        endpoints.append(str(desc))
+    return endpoints
+
 
 @dataclass
 class _PoolIOPlan:
@@ -335,6 +385,90 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+
+    def _get_local_mooncake_segment_id(self) -> str:
+        cached = getattr(self, "_cached_local_mooncake_segment_id", None)
+        if cached is not None:
+            return cached
+        local_segment = ""
+        if self.store is not None and hasattr(self.store, "get_hostname"):
+            try:
+                local_segment = self.store.get_hostname() or ""
+            except Exception:
+                pass
+        if not local_segment and self.config is not None:
+            local_segment = self.config.local_hostname or ""
+        self._cached_local_mooncake_segment_id = local_segment
+        return local_segment
+
+    def _log_batch_exist_segments(
+        self, key_strs: List[str], exist_result: List[int]
+    ) -> None:
+        global _warned_missing_batch_get_replica_desc
+        try:
+            import torch
+
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if torch.distributed.is_initialized():
+                if get_tensor_model_parallel_rank() != 0:
+                    return
+        except Exception:
+            pass
+
+        local_segment = self._get_local_mooncake_segment_id()
+        local_host = _mooncake_endpoint_host(local_segment)
+
+        existing_keys = [
+            key for key, exists in zip(key_strs, exist_result) if exists == 1
+        ]
+        replica_map: dict = {}
+        if existing_keys and hasattr(self.store, "batch_get_replica_desc"):
+            try:
+                replica_map = self.store.batch_get_replica_desc(existing_keys) or {}
+            except Exception as exc:
+                logger.info(
+                    "%s batch_get_replica_desc failed: %s",
+                    _MOONCAKE_EXISTS_SEGMENT_LOG_PREFIX,
+                    exc,
+                )
+        elif existing_keys and not _warned_missing_batch_get_replica_desc:
+            _warned_missing_batch_get_replica_desc = True
+            logger.info(
+                "%s batch_get_replica_desc is unavailable in the installed "
+                "mooncake package; upgrade Mooncake to log per-key segment "
+                "endpoints. exists results are still logged.",
+                _MOONCAKE_EXISTS_SEGMENT_LOG_PREFIX,
+            )
+
+        lines = [
+            f"{_MOONCAKE_EXISTS_SEGMENT_LOG_PREFIX} "
+            f"local_segment={local_segment!r} keys={len(key_strs)}"
+        ]
+        for key, exists in zip(key_strs, exist_result):
+            if exists != 1:
+                lines.append(f"  key={key!r} exists=0")
+                continue
+            endpoints = _mooncake_extract_replica_endpoints(replica_map.get(key))
+            if not endpoints:
+                lines.append(f"  key={key!r} exists=1 segments=unknown")
+                continue
+            remote_hosts = {
+                host
+                for host in (_mooncake_endpoint_host(ep) for ep in endpoints)
+                if host and host != local_host
+            }
+            cross_machine = bool(remote_hosts)
+            lines.append(
+                f"  key={key!r} exists=1 segments={endpoints} "
+                f"cross_machine={cross_machine}"
+                + (
+                    f" remote_hosts={sorted(remote_hosts)}"
+                    if cross_machine
+                    else ""
+                )
+            )
+        logger.info("\n".join(lines))
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
@@ -1685,7 +1819,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        exist_result = self.store.batch_is_exist(key_strs)
+        if envs.SGLANG_MOONCAKE_EXISTS_SEGMENT_LOG.get():
+            self._log_batch_exist_segments(key_strs, exist_result)
+        return exist_result
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
