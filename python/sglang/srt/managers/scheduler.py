@@ -2575,6 +2575,26 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        # Log prefix hit breakdown per prefill batch
+        total_hit = 0
+        device_hit = 0
+        host_hit = 0
+        storage_hit = 0
+        for req in can_run_list:
+            prefix_len = len(req.prefix_indices)
+            req_host_hit = req.host_hit_length
+            req_storage_hit = req.storage_hit_length
+            req_device_hit = prefix_len - req_host_hit
+            req_host_only = req_host_hit - req_storage_hit
+            total_hit += prefix_len
+            device_hit += req_device_hit
+            host_hit += req_host_only
+            storage_hit += req_storage_hit
+        logger.info(
+            "Prefill batch prefix hit breakdown: batch_size=%d total_hit=%d device_hit=%d host_hit=%d storage_hit=%d",
+            len(can_run_list), total_hit, device_hit, host_hit, storage_hit,
+        )
+
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
