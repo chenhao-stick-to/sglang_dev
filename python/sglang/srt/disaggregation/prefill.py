@@ -134,6 +134,7 @@ class PrefillBootstrapQueue:
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
+            pass
             # FIXME: current SWA allocation allocate full kv cache size in prefill
             # self.max_total_num_tokens = min(
             #     self.max_total_num_tokens,
