@@ -890,8 +890,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         #   prefetch KV page hash chain (kv_page_keys) and only add pool suffixes.
         # - SWA and state pools are window-local; hash each host page from the
         #   page's tokens without chaining the full prefix.
+
         if self._is_dsv4_required_prefix_pool(transfer.name):
             token_ids = self._extra_token_ids(extra_info)
+            logger_info(f"token_ids_prefix: {token_ids[:5]}")
             if token_ids is not None:
                 max_kv_pages = (len(token_ids) + kv_page_size - 1) // kv_page_size
                 num_kv_pages = min(len(kv_page_keys), max_kv_pages)
@@ -903,8 +905,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return self._dsv4_slice_page_hashes_by_token_range(
                 page_hashes, pool_page_size, extra_info, transfer
             )
-
         token_ids = self._extra_token_ids(extra_info)
+        logger_info(f"token_ids_swa_state: {token_ids[:5]}")
         if token_ids is None:
             return None
         token_limit = min(len(token_ids), len(kv_page_keys) * kv_page_size)
