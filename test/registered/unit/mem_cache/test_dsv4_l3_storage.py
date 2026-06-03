@@ -625,6 +625,16 @@ class TestUnifiedRadixPrefetch(unittest.TestCase):
         self.assertNotIn("req-oom", cache.ongoing_prefetch)
 
 
+class TestHybridControllerStorageTokenIds(unittest.TestCase):
+    def test_storage_raw_token_ids_matches_write_backup_bigram_slice(self):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        key = RadixKey([98050, 98051, 98052, 98053, 98054, 98055], is_bigram=True)
+        raw = HybridCacheController._storage_raw_token_ids(key)
+        self.assertEqual(raw, key.token_ids[: len(key)])
+        self.assertEqual(raw, [98050, 98051, 98052, 98053, 98054])
+
+
 class TestHybridControllerPrefetchPools(unittest.TestCase):
     def test_prepare_storage_prefetch_uses_hit_query_token_range(self):
         class AllocatingHostPool:

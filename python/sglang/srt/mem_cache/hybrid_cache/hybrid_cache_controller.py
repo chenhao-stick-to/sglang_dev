@@ -470,9 +470,18 @@ class HybridCacheController(BaseHiCacheController):
         entry_map = getattr(self.mem_pool_host, "entry_map", {})
         return any(name in entry_map for name in _DSV4_REQUIRED_PREFIX_POOL_NAMES)
 
+    @staticmethod
+    def _storage_raw_token_ids(token_ids) -> List[int]:
+        """Raw token ids for Mooncake SWA/state keys (same slice as write_backup_storage)."""
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        if isinstance(token_ids, RadixKey):
+            return token_ids.token_ids[: len(token_ids)]
+        return list(token_ids)
+
     def _storage_extra_info(self, operation) -> HiCacheStorageExtraInfo:
         extra = {
-            "token_ids": list(operation.token_ids),
+            "token_ids": self._storage_raw_token_ids(operation.token_ids),
             "last_hash": operation.last_hash,
             "page_size": self.page_size,
             "sliding_window_size": getattr(self, "sliding_window_size", None),
