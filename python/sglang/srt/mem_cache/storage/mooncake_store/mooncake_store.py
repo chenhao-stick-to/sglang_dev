@@ -405,16 +405,16 @@ class MooncakeBaseStore:
         self, key_strs: List[str], exist_result: List[int]
     ) -> None:
         global _warned_missing_batch_get_replica_desc
-        try:
-            import torch
+        # try:
+        #     import torch
 
-            from sglang.srt.distributed import get_tensor_model_parallel_rank
+        #     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-            if torch.distributed.is_initialized():
-                if get_tensor_model_parallel_rank() != 0:
-                    return
-        except Exception:
-            pass
+        #     if torch.distributed.is_initialized():
+        #         if get_tensor_model_parallel_rank() != 0:
+        #             return
+        # except Exception:
+        #     pass
 
         local_segment = self._get_local_mooncake_segment_id()
         local_host = _mooncake_endpoint_host(local_segment)
