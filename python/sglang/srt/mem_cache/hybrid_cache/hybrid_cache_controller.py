@@ -477,6 +477,8 @@ class HybridCacheController(BaseHiCacheController):
             "page_size": self.page_size,
             "sliding_window_size": getattr(self, "sliding_window_size", None),
         }
+        if operation.hash_value:
+            extra["kv_page_hashes"] = list(operation.hash_value)
         pool_token_ranges = getattr(
             operation.pool_storage_result, "pool_token_ranges", None
         )
@@ -495,6 +497,10 @@ class HybridCacheController(BaseHiCacheController):
                 operation.token_ids[start : start + self.page_size], last_hash
             )
             hash_value.append(last_hash)
+
+        # Reuse the same KV page hashes for DSV4 required-prefix pools during
+        # batch_exists_v2 / batch_get_v2; SWA/state pools still key by tokens.
+        operation.hash_value = hash_value
 
         extra_info = self._storage_extra_info(operation)
         if operation.pool_transfers:

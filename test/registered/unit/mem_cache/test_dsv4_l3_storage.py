@@ -54,7 +54,7 @@ def _make_dsv4_store(kv_page_size: int = 4, swa_page_size: int = 2):
 
 
 class TestDeepSeekV4MooncakeKeying(unittest.TestCase):
-    def test_required_prefix_pool_keys_are_chained_from_prior_hash(self):
+    def test_required_prefix_pool_keys_reuse_kv_page_hashes(self):
         store = _make_dsv4_store(kv_page_size=4)
         token_ids = list(range(1, 9))
         prior_hash = "parent-page-hash"
@@ -67,9 +67,7 @@ class TestDeepSeekV4MooncakeKeying(unittest.TestCase):
             ["tree-page-0", "tree-page-1"], transfer, extra_info
         )
 
-        expected_first = get_hash_str(token_ids[:4], prior_hash)
-        expected_second = get_hash_str(token_ids[4:8], expected_first)
-        self.assertEqual(keys, [expected_first, expected_second])
+        self.assertEqual(keys, ["tree-page-0", "tree-page-1"])
 
     def test_swa_and_state_pool_keys_are_unchained_by_swa_page_size(self):
         store = _make_dsv4_store(kv_page_size=4, swa_page_size=2)

@@ -851,6 +851,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 page_hashes.append(get_hash_str(page_tokens, None))
         return page_hashes
 
+    def _dsv4_slice_page_hashes_by_token_range(
+        self,
+        page_hashes: List[str],
+        pool_page_size: int,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+        transfer: PoolTransfer,
+    ) -> List[str]:
+        token_range = self._pool_token_range(transfer, extra_info)
+        if token_range is None:
+            return page_hashes
+        start_token, end_token = token_range
+        start_page = max(0, start_token // pool_page_size)
+        end_page = max(start_page, (end_token + pool_page_size - 1) // pool_page_size)
+        return page_hashes[start_page:end_page]
+
     def _dsv4_storage_page_keys(
         self,
         kv_page_keys: List[str],
@@ -863,39 +878,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             return None
 
-        token_ids = self._extra_token_ids(extra_info)
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
-        if token_ids is None or host_pool is None:
+        if host_pool is None:
             return None
 
         kv_page_size = self._kv_page_size()
         pool_page_size = getattr(host_pool, "page_size", kv_page_size) or kv_page_size
-        token_limit = min(len(token_ids), len(kv_page_keys) * kv_page_size)
-        token_ids = token_ids[:token_limit]
 
         # DeepSeek V4 stores two kinds of objects:
-        # - required prefix pools (C4/C4 indexer/C128) are chained from the
-        #   prefix prior hash and must all exist from page 0 to the accepted
-        #   prefix boundary.
-        # - SWA and state pools are window-local; their hashes intentionally do
-        #   not include the full-prefix chain and must exist for every
-        #   swa_page_size subpage covered by the accepted prefix boundary.
-        chained = self._is_dsv4_required_prefix_pool(transfer.name)
+        # - required prefix pools (C4/C4 indexer/C128) reuse the radix-tree /
+        #   prefetch KV page hash chain (kv_page_keys) and only add pool suffixes.
+        # - SWA and state pools are window-local; hash each host page from the
+        #   page's tokens without chaining the full prefix.
+        if self._is_dsv4_required_prefix_pool(transfer.name):
+            token_ids = self._extra_token_ids(extra_info)
+            if token_ids is not None:
+                max_kv_pages = (len(token_ids) + kv_page_size - 1) // kv_page_size
+                num_kv_pages = min(len(kv_page_keys), max_kv_pages)
+            else:
+                num_kv_pages = len(kv_page_keys)
+            page_hashes = self._page_keys_for_transfer(
+                kv_page_keys[:num_kv_pages], transfer
+            )
+            return self._dsv4_slice_page_hashes_by_token_range(
+                page_hashes, pool_page_size, extra_info, transfer
+            )
+
+        token_ids = self._extra_token_ids(extra_info)
+        if token_ids is None:
+            return None
+        token_limit = min(len(token_ids), len(kv_page_keys) * kv_page_size)
+        token_ids = token_ids[:token_limit]
         page_hashes = self._dsv4_page_hashes_from_tokens(
             token_ids,
             pool_page_size,
-            self._extra_prior_hash(extra_info) if chained else None,
-            chained,
+            None,
+            chained=False,
         )
-
-        token_range = self._pool_token_range(transfer, extra_info)
-        if token_range is None:
-            return page_hashes
-
-        start_token, end_token = token_range
-        start_page = max(0, start_token // pool_page_size)
-        end_page = max(start_page, (end_token + pool_page_size - 1) // pool_page_size)
-        return page_hashes[start_page:end_page]
+        return self._dsv4_slice_page_hashes_by_token_range(
+            page_hashes, pool_page_size, extra_info, transfer
+        )
 
     def _legacy_storage_page_keys(
         self,
