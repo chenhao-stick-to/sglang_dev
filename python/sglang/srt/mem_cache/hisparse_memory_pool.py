@@ -367,14 +367,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
         if self.free_group:
             all_indices = torch.cat(self.free_group)
             # Deduplicate to prevent double-free when the same full index
             # appears in the free_group multiple times (e.g. EAGLE rejected
             # drafts freed during verify and again via release_kv_cache).
             all_indices = torch.unique(all_indices)
-            self.free(all_indices)
+            # Only release logical (FULL) slots; hisparse was eagerly freed in free().
+            self.logical_attn_allocator.free(all_indices)
+            self.free_group = []
+        self.is_not_in_free_group = True
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

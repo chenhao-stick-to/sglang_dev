@@ -609,6 +609,42 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # release the same SWA slot twice.
             self.free_swa(free_index)
             self.free_group.append(free_index)
+
+        full_avail = self.full_attn_allocator.available_size()
+        swa_avail = self.swa_attn_allocator.available_size()
+        if swa_avail > self.swa_attn_allocator.size:
+            logger.error(
+                "SWA double-free detected: swa_available=%d swa_size=%d "
+                "full_available=%d full_size=%d "
+                "free_index_numel=%d is_not_in_free_group=%s "
+                "free_group_len=%d "
+                "swa_free_pages_len=%d swa_release_pages_len=%d "
+                "swa_free_group_len=%d",
+                swa_avail,
+                self.swa_attn_allocator.size,
+                full_avail,
+                self.full_attn_allocator.size,
+                free_index.numel(),
+                self.is_not_in_free_group,
+                len(self.free_group),
+                len(self.swa_attn_allocator.free_pages),
+                len(self.swa_attn_allocator.release_pages),
+                len(self.swa_attn_allocator.free_group),
+            )
+            # Log the SWA indices being freed to identify the source
+            swa_indices_debug = self.full_to_swa_index_mapping[free_index]
+            swa_nonzero = swa_indices_debug[swa_indices_debug > 0]
+            if swa_nonzero.numel() > 0:
+                logger.error(
+                    "SWA indices being freed: numel=%d min=%d max=%d "
+                    "swa_size=%d page_size=%d",
+                    swa_nonzero.numel(),
+                    swa_nonzero.min().item(),
+                    swa_nonzero.max().item(),
+                    self.swa_attn_allocator.size,
+                    self.page_size,
+                )
+
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -642,6 +678,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
+        if swa_indices.numel() > 0:
+            swa_indices = torch.unique(swa_indices)
+        if swa_indices.numel() > 0 and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "free_swa: free_index_numel=%d swa_indices_numel=%d "
+                "swa_avail_before=%d swa_size=%d",
+                free_index.numel(),
+                swa_indices.numel(),
+                self.swa_attn_allocator.available_size(),
+                self.swa_attn_allocator.size,
+            )
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
 
@@ -661,7 +708,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
         if self.free_group:
             all_indices = torch.cat(self.free_group)
             # Deduplicate: the same full index can appear multiple times
@@ -672,7 +718,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # full_attn_allocator.free() is not idempotent — a duplicate
             # would inflate available_size beyond capacity.
             all_indices = torch.unique(all_indices)
-            self.free(all_indices)
+            # Only release FULL slots here; SWA was eagerly freed in free().
+            self.full_attn_allocator.free(all_indices)
+            self.free_group = []
+        self.is_not_in_free_group = True
 
     def clear(self):
         self._kvcache.invalidate_loc_cache()
