@@ -601,11 +601,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
+            # Eagerly execute free_swa so that the full→SWA mapping is cleared
+            # *now*.  This prevents a double-free when the same full indices
+            # appear in the free_group twice (e.g. EAGLE rejected drafts in
+            # the same batch as a finished request).  Without this, the mapping
+            # stays populated and free_group_end → free → free_swa would
+            # release the same SWA slot twice.
+            self.free_swa(free_index)
             self.free_group.append(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        # NOTE: the SWA assertion is only checked outside free_group because
+        # inside a free_group the full_attn_allocator.free() is deferred —
+        # its available_size does not reflect the pending frees yet.  The SWA
+        # side is already eagerly freed above, so the assertion would
+        # spuriously fail if checked inside the group.
+        if self.is_not_in_free_group:
+            assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
@@ -642,6 +655,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(state) == 2
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            all_indices = torch.cat(self.free_group)
+            # Deduplicate: the same full index can appear multiple times
+            # in the free_group (e.g. EAGLE rejected drafts freed once
+            # during verify, then again via release_kv_cache).  The SWA
+            # mapping is already cleared by the eager free_swa in free(),
+            # so duplicate entries are harmless for SWA, but
+            # full_attn_allocator.free() is not idempotent — a duplicate
+            # would inflate available_size beyond capacity.
+            all_indices = torch.unique(all_indices)
+            self.free(all_indices)
 
     def clear(self):
         self._kvcache.invalidate_loc_cache()

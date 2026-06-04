@@ -363,10 +363,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free_group_begin(self):
-        return
+        self.is_not_in_free_group = False
+        self.free_group = []
 
     def free_group_end(self):
-        return
+        self.is_not_in_free_group = True
+        if self.free_group:
+            all_indices = torch.cat(self.free_group)
+            # Deduplicate to prevent double-free when the same full index
+            # appears in the free_group multiple times (e.g. EAGLE rejected
+            # drafts freed during verify and again via release_kv_cache).
+            all_indices = torch.unique(all_indices)
+            self.free(all_indices)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -375,14 +383,21 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:
+            # Eagerly free hisparse mapping to prevent double-free when the
+            # same full indices appear in the free_group twice.
+            self.free_hisparse(free_index)
             self.free_group.append(free_index)
         assert (
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
         )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
+        # Only check hisparse assertion outside free_group; inside the
+        # group, logical_attn_allocator.free() is deferred so its
+        # available_size does not reflect pending frees yet.
+        if self.is_not_in_free_group:
+            assert (
+                self.hisparse_attn_allocator.available_size()
+                <= self.hisparse_attn_allocator.size
         )
 
 
