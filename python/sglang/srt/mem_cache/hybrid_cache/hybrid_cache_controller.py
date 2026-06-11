@@ -613,6 +613,32 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
+    @staticmethod
+    def _sidecar_pool_io_incomplete(
+        pool_transfers: list[PoolTransfer],
+        results: dict[str, list[bool]],
+    ) -> bool:
+        """Return True when any sidecar pool transferred fewer pages than requested."""
+        for transfer in pool_transfers:
+            if not transfer.keys:
+                continue
+            expected_pages = len(transfer.keys)
+            completed_pages = sum(results.get(transfer.name, []))
+            if completed_pages < expected_pages:
+                return True
+        return False
+
+    def _fail_prefetch_operation(self, operation: PrefetchOperation) -> None:
+        """Abort prefetch after KV or sidecar IO failure; release all host slots."""
+        with operation._lock:
+            operation.completed_tokens = 0
+            operation._terminated_flag = True
+
+    @staticmethod
+    def _fail_backup_operation(operation: StorageOperation) -> None:
+        """Abort storage backup after sidecar IO failure; skip KV pages."""
+        operation.completed_tokens = 0
+
     def _page_transfer(self, operation):
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
@@ -628,17 +654,43 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if self._sidecar_pool_io_incomplete(operation.pool_transfers, results):
+                logger.warning(
+                    "Sidecar pool prefetch incomplete for operation %s: %s",
+                    operation.id,
+                    {
+                        transfer.name: sum(results.get(transfer.name, []))
+                        for transfer in operation.pool_transfers
+                        if transfer.keys
+                    },
+                )
+                self._fail_prefetch_operation(operation)
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
-        # Backup extra pools
+        sidecar_backup_ok = True
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            sidecar_backup_ok = not self._sidecar_pool_io_incomplete(
+                operation.pool_transfers, results
+            )
+            if not sidecar_backup_ok:
+                logger.warning(
+                    "Sidecar pool backup incomplete for operation %s: %s",
+                    operation.id,
+                    {
+                        transfer.name: sum(results.get(transfer.name, []))
+                        for transfer in operation.pool_transfers
+                        if transfer.keys
+                    },
+                )
+                self._fail_backup_operation(operation)
 
-        # Backup kv pools
-        super()._page_backup(operation)
+        # Backup KV only when sidecar pools are fully written (or absent).
+        if sidecar_backup_ok:
+            super()._page_backup(operation)
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

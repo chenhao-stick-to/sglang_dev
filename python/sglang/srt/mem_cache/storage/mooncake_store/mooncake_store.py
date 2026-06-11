@@ -808,9 +808,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
-            results[transfer.name] = self._batch_postprocess(
+            post_result= self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
+            # 这里poolresult如果不是全成功则直接返回results！
+            # If the post_result (PoolTransferResult) is not fully successful, immediately return results
+            if not all(post_result):
+                results[transfer.name] = post_result
+                for transfer_tmp in transfers:
+                    if transfer_tmp.name not in results:
+                        results[transfer_tmp.name] = []
+                return results
+            results[transfer.name] = post_result
         return results
 
     def batch_get_v2(
